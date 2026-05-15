@@ -52372,6 +52372,115 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     }
 }
 
+static int js_preview_entries_push(JSContext *ctx, JSValueConst entries,
+                                   uint32_t *index, JSValueConst value)
+{
+    uint32_t i = *index;
+    if (JS_SetPropertyUint32(ctx, entries, i, JS_DupValue(ctx, value)) < 0)
+        return -1;
+    *index = i + 1;
+    return 0;
+}
+
+static int js_preview_entries_push_record(JSContext *ctx, JSValueConst entries,
+                                          uint32_t *index, JSMapRecord *mr,
+                                          int magic, JSIteratorKindEnum kind)
+{
+    JSValueConst value = magic ? mr->key : mr->value;
+
+    if (kind == JS_ITERATOR_KIND_KEY) {
+        return js_preview_entries_push(ctx, entries, index, mr->key);
+    } else if (kind == JS_ITERATOR_KIND_VALUE) {
+        return js_preview_entries_push(ctx, entries, index, value);
+    } else {
+        return js_preview_entries_push(ctx, entries, index, mr->key) ||
+               js_preview_entries_push(ctx, entries, index, value);
+    }
+}
+
+static JSValue js_preview_entries_from_records(JSContext *ctx,
+                                               struct list_head *first,
+                                               const struct list_head *records,
+                                               int magic,
+                                               JSIteratorKindEnum kind)
+{
+    JSValue entries;
+    JSMapRecord *mr;
+    struct list_head *el;
+    uint32_t index = 0;
+
+    entries = JS_NewArray(ctx);
+    if (JS_IsException(entries))
+        return entries;
+
+    for (el = first; el != records; el = el->next) {
+        mr = list_entry(el, JSMapRecord, link);
+        if (mr->empty)
+            continue;
+        if (js_preview_entries_push_record(ctx, entries, &index, mr, magic, kind)) {
+            JS_FreeValue(ctx, entries);
+            return JS_EXCEPTION;
+        }
+    }
+
+    return entries;
+}
+
+JSValue JS_PreviewEntries(JSContext *ctx, JSValueConst val,
+                          bool *is_key_value_out)
+{
+    JSClassID class_id;
+    JSMapIteratorData *it;
+    JSMapState *s;
+    int magic;
+    JSIteratorKindEnum kind;
+    struct list_head *first;
+
+    if (!is_key_value_out)
+        return JS_ThrowTypeError(ctx, "invalid argument");
+
+    *is_key_value_out = false;
+    if (!JS_IsObject(val))
+        return JS_UNDEFINED;
+
+    class_id = JS_GetClassID(val);
+    switch (class_id) {
+    case JS_CLASS_MAP:
+        s = JS_GetOpaque(val, JS_CLASS_MAP);
+        if (!s)
+            return JS_UNDEFINED;
+        *is_key_value_out = true;
+        return js_preview_entries_from_records(ctx, s->records.next,
+                                               &s->records, 0,
+                                               JS_ITERATOR_KIND_KEY_AND_VALUE);
+    case JS_CLASS_SET:
+        s = JS_GetOpaque(val, JS_CLASS_SET);
+        if (!s)
+            return JS_UNDEFINED;
+        return js_preview_entries_from_records(ctx, s->records.next,
+                                               &s->records, MAGIC_SET,
+                                               JS_ITERATOR_KIND_KEY);
+    case JS_CLASS_MAP_ITERATOR:
+    case JS_CLASS_SET_ITERATOR:
+        magic = class_id == JS_CLASS_SET_ITERATOR ? MAGIC_SET : 0;
+        it = JS_GetOpaque(val, JS_CLASS_MAP_ITERATOR + magic);
+        if (!it)
+            return JS_UNDEFINED;
+        kind = it->kind;
+        *is_key_value_out = kind == JS_ITERATOR_KIND_KEY_AND_VALUE;
+        if (JS_IsUndefined(it->obj))
+            return JS_NewArray(ctx);
+        s = JS_GetOpaque(it->obj, JS_CLASS_MAP + magic);
+        if (!s)
+            return JS_UNDEFINED;
+        first = it->cur_record ? it->cur_record->link.next : s->records.next;
+        return js_preview_entries_from_records(ctx, first, &s->records,
+                                               magic, kind);
+    default:
+        return JS_UNDEFINED;
+    }
+}
+
 static JSValue js_map_read(BCReaderState *s, int magic)
 {
     JSContext *ctx = s->ctx;

@@ -938,6 +938,8 @@ JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool 
 JS_EXTERN bool JS_IsRegExp(JSValueConst val);
 JS_EXTERN bool JS_IsMap(JSValueConst val);
 JS_EXTERN bool JS_IsSet(JSValueConst val);
+JS_EXTERN JSValue JS_PreviewEntries(JSContext *ctx, JSValueConst val,
+                                    bool *is_key_value_out);
 JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
 JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
 JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
