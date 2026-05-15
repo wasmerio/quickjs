@@ -3440,6 +3440,18 @@ JSValue JS_NewSymbol(JSContext *ctx, const char *description, bool is_global)
     return JS_NewSymbolFromAtom(ctx, atom, is_global ? JS_ATOM_TYPE_GLOBAL_SYMBOL : JS_ATOM_TYPE_SYMBOL);
 }
 
+JSValue JS_NewPrivateSymbol(JSContext *ctx, const char *description)
+{
+    JSAtom atom;
+
+    if (description == NULL)
+        description = "";
+    atom = JS_NewAtom(ctx, description);
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    return JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+}
+
 #define ATOM_GET_STR_BUF_SIZE 64
 
 static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
@@ -7746,6 +7758,33 @@ static bool can_add_backtrace(JSValueConst obj)
 #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
 #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
 
+static JSValue js_error_lazy_stack_getter(JSContext *ctx,
+                                          JSValueConst this_val,
+                                          int argc,
+                                          JSValueConst *argv,
+                                          int magic,
+                                          JSValueConst *func_data)
+{
+    JSValue stack;
+    JSValueConst args[2];
+
+    (void)argc;
+    (void)argv;
+    (void)magic;
+
+    args[0] = this_val;
+    args[1] = func_data[1];
+    stack = JS_Call(ctx, func_data[0], ctx->error_ctor, countof(args), args);
+    if (JS_IsException(stack))
+        return JS_EXCEPTION;
+    if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(stack),
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+        JS_FreeValue(ctx, stack);
+        return JS_EXCEPTION;
+    }
+    return stack;
+}
+
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
 static void build_backtrace(JSContext *ctx, JSValueConst error_val,
@@ -7759,7 +7798,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     const char *str1;
     JSObject *p;
     JSFunctionBytecode *b;
-    bool backtrace_barrier, has_prepare, has_filter_func;
+    bool backtrace_barrier, has_prepare, has_filter_func, stack_property_defined;
     JSRuntime *rt;
     JSCallSiteData csd[64];
     uint32_t i;
@@ -7793,6 +7832,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     stack_trace_limit = max_int(stack_trace_limit, 0);
     has_prepare = false;
     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
+    stack_property_defined = false;
     i = 0;
     prepare = JS_UNDEFINED;
 
@@ -7929,16 +7969,36 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         for (k = j; k < i; k++) {
             js_callsite_free_data(ctx, &csd[k]);
         }
-        JSValueConst args[] = {
-            error_val,
-            stack,
-        };
-        JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
-        JS_FreeValue(ctx, stack);
-        if (JS_IsException(stack2))
-            stack = JS_NULL;
-        else
-            stack = stack2;
+        if (!JS_IsNull(stack) && (has_filter_func || can_add_backtrace(error_val))) {
+            JSValueConst data[] = { prepare, stack };
+            JSValue getter = JS_NewCFunctionData2(ctx, js_error_lazy_stack_getter,
+                                                  "get stack", 0, 0,
+                                                  countof(data), data);
+            if (JS_IsException(getter)) {
+                JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+            } else if (JS_DefinePropertyGetSet(ctx, error_val, JS_ATOM_stack,
+                                               getter, JS_UNDEFINED,
+                                               JS_PROP_CONFIGURABLE) == 0) {
+                stack_property_defined = true;
+            } else {
+                JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+            }
+        }
+        if (stack_property_defined) {
+            JS_FreeValue(ctx, stack);
+            stack = JS_UNDEFINED;
+        } else {
+            JSValueConst args[] = {
+                error_val,
+                stack,
+            };
+            JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
+            JS_FreeValue(ctx, stack);
+            if (JS_IsException(stack2))
+                stack = JS_NULL;
+            else
+                stack = stack2;
+        }
         JS_FreeValue(ctx, prepare);
         JS_Throw(ctx, saved_exception);
     } else {
@@ -7949,13 +8009,15 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         dbuf_free(&dbuf);
     }
 
-    if (JS_IsUndefined(ctx->error_back_trace))
-        ctx->error_back_trace = js_dup(stack);
-    if (has_filter_func || can_add_backtrace(error_val)) {
-        JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    } else {
-        JS_FreeValue(ctx, stack);
+    if (!stack_property_defined) {
+        if (JS_IsUndefined(ctx->error_back_trace))
+            ctx->error_back_trace = js_dup(stack);
+        if (has_filter_func || can_add_backtrace(error_val)) {
+            JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        } else {
+            JS_FreeValue(ctx, stack);
+        }
     }
 
     rt->in_build_stack_trace = false;
@@ -18117,7 +18179,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (ret < 0)
                     goto exception;
                 if (!ret) {
-                    JS_ThrowTypeError(ctx, "invalid brand on object");
+                    JS_ThrowTypeError(ctx, "Receiver must be an instance of class");
                     goto exception;
                 }
             }
