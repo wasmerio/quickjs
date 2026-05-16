@@ -53246,6 +53246,8 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         hook_promise = js_promise_reaction_promise(argv[0]);
         if (JS_IsUndefined(hook_promise))
             hook_promise = js_promise_reaction_promise(argv[1]);
+        if (JS_IsUndefined(hook_promise))
+            hook_promise = js_promise_reaction_promise(handler);
         rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, hook_promise,
                          JS_UNDEFINED, rt->promise_hook_opaque);
     }
