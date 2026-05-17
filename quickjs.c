@@ -7785,6 +7785,26 @@ static JSValue js_error_lazy_stack_getter(JSContext *ctx,
     return stack;
 }
 
+static JSValue js_error_lazy_stack_setter(JSContext *ctx,
+                                          JSValueConst this_val,
+                                          int argc,
+                                          JSValueConst *argv,
+                                          int magic,
+                                          JSValueConst *func_data)
+{
+    JSValueConst stack;
+
+    (void)magic;
+    (void)func_data;
+
+    stack = argc > 0 ? argv[0] : JS_UNDEFINED;
+    if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(stack),
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+        return JS_EXCEPTION;
+    }
+    return JS_UNDEFINED;
+}
+
 /* if filename != NULL, an additional level is added with the filename
    and line number information (used for parse error). */
 static void build_backtrace(JSContext *ctx, JSValueConst error_val,
@@ -7976,12 +7996,20 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                                                   countof(data), data);
             if (JS_IsException(getter)) {
                 JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
-            } else if (JS_DefinePropertyGetSet(ctx, error_val, JS_ATOM_stack,
-                                               getter, JS_UNDEFINED,
-                                               JS_PROP_CONFIGURABLE) == 0) {
-                stack_property_defined = true;
             } else {
-                JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+                JSValue setter = JS_NewCFunctionData2(ctx, js_error_lazy_stack_setter,
+                                                      "set stack", 1, 0,
+                                                      0, NULL);
+                if (JS_IsException(setter)) {
+                    JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+                    JS_FreeValue(ctx, getter);
+                } else if (JS_DefinePropertyGetSet(ctx, error_val, JS_ATOM_stack,
+                                                   getter, setter,
+                                                   JS_PROP_CONFIGURABLE) == 0) {
+                    stack_property_defined = true;
+                } else {
+                    JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+                }
             }
         }
         if (stack_property_defined) {
