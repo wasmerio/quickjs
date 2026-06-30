@@ -373,6 +373,8 @@ typedef struct JSStackFrame {
     JSValue *arg_buf; /* arguments */
     JSValue *var_buf; /* variables */
     struct JSVarRef **var_refs; /* references to arguments or local variables */
+    struct JSAsyncFunctionState *async_func; /* != NULL if this is an async
+                                                function/generator frame */
     uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                         instruction after the call */
     uint16_t var_ref_count; /* number of var refs */
@@ -424,6 +426,9 @@ typedef struct JSVarRef {
         struct {
             uint16_t var_ref_idx; /* index in JSStackFrame.var_refs[] */
             JSStackFrame *stack_frame;
+            struct JSAsyncFunctionState *async_func; /* != NULL if captured
+                from an async function/generator stack frame; holds a counted
+                reference so the cycle collector can reach the async state */
         }; /* used when is_detached = false */
     };
 } JSVarRef;
@@ -884,20 +889,15 @@ typedef struct JSTypedArray {
 } JSTypedArray;
 
 typedef struct JSAsyncFunctionState {
-    JSValue this_val; /* 'this' generator argument */
+    JSGCObjectHeader header; /* must come first */
+    JSValue this_val; /* 'this' argument */
     int argc; /* number of function arguments */
     bool throw_flag; /* used to throw an exception in JS_CallInternal() */
+    bool is_completed; /* true if the function has returned. The stack
+                          frame is no longer valid */
+    JSValue resolving_funcs[2]; /* only used in JS async functions */
     JSStackFrame frame;
 } JSAsyncFunctionState;
-
-/* XXX: could use an object instead to avoid the
-   JS_TAG_ASYNC_FUNCTION tag for the GC */
-typedef struct JSAsyncFunctionData {
-    JSGCObjectHeader header; /* must come first */
-    JSValue resolving_funcs[2];
-    bool is_active; /* true if the async function state is valid */
-    JSAsyncFunctionState func_state;
-} JSAsyncFunctionData;
 
 typedef struct JSReqModuleEntry {
     JSAtom module_name;
@@ -1083,7 +1083,7 @@ struct JSObject {
         struct JSProxyData *proxy_data; /* JS_CLASS_PROXY */
         struct JSPromiseData *promise_data; /* JS_CLASS_PROMISE */
         struct JSPromiseFunctionData *promise_function_data; /* JS_CLASS_PROMISE_RESOLVE_FUNCTION, JS_CLASS_PROMISE_REJECT_FUNCTION */
-        struct JSAsyncFunctionData *async_function_data; /* JS_CLASS_ASYNC_FUNCTION_RESOLVE, JS_CLASS_ASYNC_FUNCTION_REJECT */
+        struct JSAsyncFunctionState *async_function_data; /* JS_CLASS_ASYNC_FUNCTION_RESOLVE, JS_CLASS_ASYNC_FUNCTION_REJECT */
         struct JSAsyncFromSyncIteratorData *async_from_sync_iterator_data; /* JS_CLASS_ASYNC_FROM_SYNC_ITERATOR */
         struct JSAsyncGeneratorData *async_generator_data; /* JS_CLASS_ASYNC_GENERATOR */
         struct { /* JS_CLASS_BYTECODE_FUNCTION: 12/24 bytes */
@@ -1421,8 +1421,8 @@ static int JS_GetOwnPropertyFlagsInternal(JSContext *ctx, int *pflags,
 static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
                                        int flags, int kind);
 static void js_free_desc(JSContext *ctx, JSPropertyDescriptor *desc);
-static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
-                            JS_MarkFunc *mark_func);
+static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s);
+static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s);
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
@@ -1460,7 +1460,6 @@ static JSAtom js_symbol_to_atom(JSContext *ctx, JSValueConst val);
 static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type);
 static void remove_gc_object(JSGCObjectHeader *h);
-static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s);
 static JSValue js_instantiate_prototype(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                  void *opaque);
@@ -6484,12 +6483,15 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
         if (--var_ref->header.ref_count == 0) {
             if (var_ref->is_detached) {
                 JS_FreeValueRT(rt, var_ref->value);
-                remove_gc_object(&var_ref->header);
             } else {
                 JSStackFrame *sf = var_ref->stack_frame;
                 assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
                 sf->var_refs[var_ref->var_ref_idx] = NULL;
+                /* release the counted reference to the async function state */
+                if (var_ref->async_func)
+                    async_func_free(rt, var_ref->async_func);
             }
+            remove_gc_object(&var_ref->header);
             js_free_rt(rt, var_ref);
         }
     }
@@ -6587,7 +6589,7 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
         if (var_refs) {
             for(i = 0; i < b->closure_var_count; i++) {
                 JSVarRef *var_ref = var_refs[i];
-                if (var_ref && var_ref->is_detached) {
+                if (var_ref) {
                     mark_func(rt, &var_ref->header);
                 }
             }
@@ -6696,6 +6698,9 @@ static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
         break;
     case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
         free_function_bytecode(rt, (JSFunctionBytecode *)gp);
+        break;
+    case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
+        __async_func_free(rt, (JSAsyncFunctionState *)gp);
         break;
     default:
         abort();
@@ -6870,11 +6875,9 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                             if (pr->u.getset.setter)
                                 mark_func(rt, &pr->u.getset.setter->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-                            if (pr->u.var_ref->is_detached) {
-                                /* Note: the tag does not matter
-                                   provided it is a GC object */
-                                mark_func(rt, &pr->u.var_ref->header);
-                            }
+                            /* Note: the tag does not matter
+                               provided it is a GC object */
+                            mark_func(rt, &pr->u.var_ref->header);
                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                             js_autoinit_mark(rt, pr, mark_func);
                         }
@@ -6912,16 +6915,34 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     case JS_GC_OBJ_TYPE_VAR_REF:
         {
             JSVarRef *var_ref = (JSVarRef *)gp;
-            /* only detached variable referenced are taken into account */
-            assert(var_ref->is_detached);
-            JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            if (var_ref->is_detached) {
+                JS_MarkValue(rt, *var_ref->pvalue, mark_func);
+            } else if (var_ref->async_func) {
+                /* open var_ref captured by an async closure: reach the
+                   async function state so the cycle collector can see it */
+                mark_func(rt, &var_ref->async_func->header);
+            }
         }
         break;
     case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
         {
-            JSAsyncFunctionData *s = (JSAsyncFunctionData *)gp;
-            if (s->is_active)
-                async_func_mark(rt, &s->func_state, mark_func);
+            JSAsyncFunctionState *s = (JSAsyncFunctionState *)gp;
+            JSStackFrame *sf = &s->frame;
+            JSValue *sp;
+
+            if (!s->is_completed) {
+                JS_MarkValue(rt, sf->cur_func, mark_func);
+                JS_MarkValue(rt, s->this_val, mark_func);
+                /* sf->cur_sp = NULL if the function is running */
+                if (sf->cur_sp) {
+                    /* if the function is running, cur_sp is not known so we
+                       cannot mark the stack. Marking the variables is not needed
+                       because a running function cannot be part of a removable
+                       cycle */
+                    for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
+                        JS_MarkValue(rt, *sp, mark_func);
+                }
+            }
             JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
         }
@@ -7035,6 +7056,7 @@ static void gc_free_cycles(JSRuntime *rt)
         switch(p->gc_obj_type) {
         case JS_GC_OBJ_TYPE_JS_OBJECT:
         case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
+        case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
 #ifdef ENABLE_DUMPS // JS_DUMP_GC_FREE
             if (check_dump_flag(rt, JS_DUMP_GC_FREE)) {
                 if (!header_done) {
@@ -7058,7 +7080,8 @@ static void gc_free_cycles(JSRuntime *rt)
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
-               p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+               p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE ||
+               p->gc_obj_type == JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
         js_free_rt(rt, p);
     }
 
@@ -16312,7 +16335,7 @@ static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val,
         int i;
         if (var_refs) {
             for(i = 0; i < p->u.array.count; i++) {
-                if (var_refs[i] && var_refs[i]->is_detached)
+                if (var_refs[i])
                     mark_func(rt, &var_refs[i]->header);
             }
         }
@@ -17087,6 +17110,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         if (!var_ref)
             return NULL;
         var_ref->header.ref_count = 1;
+        add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
         var_ref->is_detached = false;
         var_ref->is_lexical = false;
         var_ref->is_const = false;
@@ -17094,6 +17118,14 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         var_ref->stack_frame = sf;
         sf->var_refs[var_ref_idx] = var_ref;
         var_ref->pvalue = pvalue;
+        /* If the stack frame belongs to an async function/generator it may be
+           detached and destroyed at any time, so the var_ref must keep a
+           counted reference to the async function state. This lets the cycle
+           collector reach the async state through the (still reachable) closure
+           var_ref instead of the async state freeing it from under us. */
+        var_ref->async_func = sf->async_func;
+        if (var_ref->async_func)
+            var_ref->async_func->header.ref_count++;
         return var_ref;
     } else {
         /* Variable is not captured (e.g., from eval closures on uncaptured vars).
@@ -17338,11 +17370,16 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
 static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
+    /* the var_ref is transitioning to detached mode; the open-frame fields
+       (incl. async_func) are no longer used afterwards, so release the counted
+       reference to the async function state now. The var_ref is already a GC
+       object (added when it was created open). */
+    if (var_ref->async_func)
+        async_func_free(rt, var_ref->async_func);
     var_ref->value = js_dup(*var_ref->pvalue);
     var_ref->pvalue = &var_ref->value;
     /* the reference is no longer to a local variable */
     var_ref->is_detached = true;
-    add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 }
 
 static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
@@ -17404,6 +17441,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
+    sf->async_func = NULL; /* not an async function frame */
     arg_buf = argv;
 
     if (unlikely(argc < arg_count)) {
@@ -17550,9 +17588,10 @@ typedef enum {
     OP_SPECIAL_OBJECT_NULL_PROTO,
 } OPSpecialObjectEnum;
 
-#define FUNC_RET_AWAIT      0
-#define FUNC_RET_YIELD      1
-#define FUNC_RET_YIELD_STAR 2
+#define FUNC_RET_AWAIT         0
+#define FUNC_RET_YIELD         1
+#define FUNC_RET_YIELD_STAR    2
+#define FUNC_RET_INITIAL_YIELD 3
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
 static void dump_single_byte_code(JSContext *ctx, const uint8_t *pc,
@@ -17695,6 +17734,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_ref_count = b->var_ref_count;
     for(i = 0; i < b->var_ref_count; i++)
         sf->var_refs[i] = NULL;
+    sf->async_func = NULL; /* not an async function frame */
     sp = stack_buf;
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
@@ -20172,8 +20212,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             ret_val = js_int32(FUNC_RET_YIELD_STAR);
             goto done_generator;
         CASE(OP_return_async):
-        CASE(OP_initial_yield):
             ret_val = JS_UNDEFINED;
+            goto done_generator;
+        CASE(OP_initial_yield):
+            ret_val = js_int32(FUNC_RET_INITIAL_YIELD);
             goto done_generator;
 
         CASE(OP_nop):
@@ -20456,18 +20498,26 @@ static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
 }
 
 /* JSAsyncFunctionState (used by generator and async functions) */
-static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
-                                       JSValueConst func_obj,
-                                       JSValueConst this_obj,
-                                       int argc, JSValueConst *argv)
+static JSAsyncFunctionState *async_func_init(JSContext *ctx,
+                                             JSValueConst func_obj,
+                                             JSValueConst this_obj,
+                                             int argc, JSValueConst *argv)
 {
+    JSAsyncFunctionState *s;
     JSObject *p;
     JSFunctionBytecode *b;
     JSStackFrame *sf;
     int local_count, i, arg_buf_len, n;
     size_t alloc_size;
 
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s)
+        return NULL;
+    s->header.ref_count = 1;
+    add_gc_object(ctx->rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+
     sf = &s->frame;
+    sf->async_func = s; /* mark the frame as an async function frame */
     p = JS_VALUE_GET_OBJ(func_obj);
     b = p->u.func.function_bytecode;
     sf->is_strict_mode = b->is_strict_mode;
@@ -20478,8 +20528,11 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     alloc_size = sizeof(JSValue) * max_int(local_count, 1) +
         sizeof(JSVarRef *) * b->var_ref_count;
     sf->arg_buf = js_malloc(ctx, alloc_size);
-    if (!sf->arg_buf)
-        return -1;
+    if (!sf->arg_buf) {
+        remove_gc_object(&s->header);
+        js_free(ctx, s);
+        return NULL;
+    }
     sf->cur_func = js_dup(func_obj);
     s->this_val = js_dup(this_obj);
     s->argc = argc;
@@ -20495,46 +20548,49 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     n = arg_buf_len + b->var_count;
     for(i = argc; i < n; i++)
         sf->arg_buf[i] = JS_UNDEFINED;
-    return 0;
+    s->resolving_funcs[0] = JS_UNDEFINED;
+    s->resolving_funcs[1] = JS_UNDEFINED;
+    s->is_completed = false;
+    return s;
 }
 
-static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
-                            JS_MarkFunc *mark_func)
+/* free the stack frame of the async function (but not the JSAsyncFunctionState
+   GC object itself, which is refcounted). Does NOT close the closure
+   variables (that must be done by close_var_refs() at completion time, while
+   the object graph may be safely mutated). */
+static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
 {
-    JSStackFrame *sf;
+    JSStackFrame *sf = &s->frame;
     JSValue *sp;
-
-    sf = &s->frame;
-    JS_MarkValue(rt, sf->cur_func, mark_func);
-    JS_MarkValue(rt, s->this_val, mark_func);
-    if (sf->cur_sp) {
-        /* if the function is running, cur_sp is not known so we
-           cannot mark the stack. Marking the variables is not needed
-           because a running function cannot be part of a removable
-           cycle */
-        for(sp = sf->arg_buf; sp < sf->cur_sp; sp++)
-            JS_MarkValue(rt, *sp, mark_func);
-    }
-}
-
-static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
-{
-    JSStackFrame *sf;
-    JSValue *sp;
-
-    sf = &s->frame;
+    int i;
 
     if (sf->arg_buf) {
-        /* close the closure variables. */
-        if (sf->var_ref_count != 0)
-            close_var_refs(rt, sf);
-
         /* cannot free the function if it is running */
         assert(sf->cur_sp != NULL);
+        /* If the frame is being torn down without close_var_refs() having
+           run (i.e. the state is GC'd while still incomplete, e.g. an async
+           generator collected as part of a cycle), any still-open closure
+           var_refs point into this frame: their var_refs[] back-pointer slot
+           lives inside arg_buf and their async_func back-pointer references
+           the state being freed. Neutralize them into detached, empty refs so
+           their eventual free_var_ref() touches neither the freed frame nor
+           the freed async state. The captured value lives in the frame slot
+           and is released by the arg_buf teardown below, so it is not dup'd
+           here (matching the "do not mutate the object graph" constraint of
+           cycle collection). */
+        for(i = 0; i < sf->var_ref_count; i++) {
+            JSVarRef *var_ref = sf->var_refs[i];
+            if (var_ref && !var_ref->is_detached) {
+                var_ref->value = JS_UNDEFINED;
+                var_ref->pvalue = &var_ref->value;
+                var_ref->is_detached = true;
+            }
+        }
         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
             JS_FreeValueRT(rt, *sp);
         }
         js_free_rt(rt, sf->arg_buf);
+        sf->arg_buf = NULL;
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
@@ -20542,16 +20598,67 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
-    JSValue func_obj;
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = &s->frame;
+    JSValue func_obj, ret;
 
-    if (js_check_stack_overflow(ctx->rt, 0))
-        return JS_ThrowStackOverflow(ctx);
+    assert(!s->is_completed);
+    if (js_check_stack_overflow(ctx->rt, 0)) {
+        ret = JS_ThrowStackOverflow(ctx);
+    } else {
+        /* the tag does not matter provided it is not an object */
+        func_obj = JS_MKPTR(JS_TAG_INT, s);
+        ret = JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
+                              s->argc, vc(sf->arg_buf),
+                              JS_CALL_FLAG_GENERATOR);
+    }
+    if (JS_IsException(ret) || JS_IsUndefined(ret)) {
+        if (JS_IsUndefined(ret)) {
+            ret = sf->cur_sp[-1];
+            sf->cur_sp[-1] = JS_UNDEFINED;
+        }
+        /* end of execution */
+        s->is_completed = true;
 
-    /* the tag does not matter provided it is not an object */
-    func_obj = JS_MKPTR(JS_TAG_INT, s);
-    return JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
-                           s->argc, vc(s->frame.arg_buf),
-                           JS_CALL_FLAG_GENERATOR);
+        /* close the closure variables. */
+        close_var_refs(rt, sf);
+
+        async_func_free_frame(rt, s);
+    }
+    return ret;
+}
+
+/* final free of the JSAsyncFunctionState GC object */
+static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
+{
+    /* cannot close the closure variables here because it would
+       potentially modify the object graph */
+    if (!s->is_completed) {
+        async_func_free_frame(rt, s);
+    }
+
+    JS_FreeValueRT(rt, s->resolving_funcs[0]);
+    JS_FreeValueRT(rt, s->resolving_funcs[1]);
+
+    remove_gc_object(&s->header);
+    if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && s->header.ref_count != 0) {
+        list_add_tail(&s->header.link, &rt->gc_zero_ref_count_list);
+    } else {
+        js_free_rt(rt, s);
+    }
+}
+
+static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
+{
+    if (--s->header.ref_count == 0) {
+        if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
+            list_del(&s->header.link);
+            list_add(&s->header.link, &rt->gc_zero_ref_count_list);
+            if (rt->gc_phase == JS_GC_PHASE_NONE) {
+                free_zero_refcount(rt);
+            }
+        }
+    }
 }
 
 
@@ -20567,14 +20674,17 @@ typedef enum JSGeneratorStateEnum {
 
 typedef struct JSGeneratorData {
     JSGeneratorStateEnum state;
-    JSAsyncFunctionState func_state;
+    JSAsyncFunctionState *func_state;
 } JSGeneratorData;
 
 static void free_generator_stack_rt(JSRuntime *rt, JSGeneratorData *s)
 {
     if (s->state == JS_GENERATOR_STATE_COMPLETED)
         return;
-    async_func_free(rt, &s->func_state);
+    if (s->func_state) {
+        async_func_free(rt, s->func_state);
+        s->func_state = NULL;
+    }
     s->state = JS_GENERATOR_STATE_COMPLETED;
 }
 
@@ -20599,9 +20709,9 @@ static void js_generator_mark(JSRuntime *rt, JSValueConst val,
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JSGeneratorData *s = p->u.generator_data;
 
-    if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
+    if (!s || !s->func_state)
         return;
-    async_func_mark(rt, &s->func_state, mark_func);
+    mark_func(rt, &s->func_state->header);
 }
 
 /* XXX: use enum */
@@ -20620,7 +20730,7 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
     *pdone = true;
     if (!s)
         return JS_ThrowTypeError(ctx, "not a generator");
-    sf = &s->func_state.frame;
+    sf = &s->func_state->frame;
     switch(s->state) {
     default:
     case JS_GENERATOR_STATE_SUSPENDED_START:
@@ -20638,23 +20748,23 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
         if (magic == GEN_MAGIC_THROW &&
             s->state == JS_GENERATOR_STATE_SUSPENDED_YIELD) {
             JS_Throw(ctx, ret);
-            s->func_state.throw_flag = true;
+            s->func_state->throw_flag = true;
         } else {
             sf->cur_sp[-1] = ret;
             sf->cur_sp[0] = js_int32(magic);
             sf->cur_sp++;
         exec_no_arg:
-            s->func_state.throw_flag = false;
+            s->func_state->throw_flag = false;
         }
         s->state = JS_GENERATOR_STATE_EXECUTING;
-        func_ret = async_func_resume(ctx, &s->func_state);
+        func_ret = async_func_resume(ctx, s->func_state);
         s->state = JS_GENERATOR_STATE_SUSPENDED_YIELD;
-        if (JS_IsException(func_ret)) {
-            /* finalize the execution in case of exception */
+        if (s->func_state->is_completed) {
+            /* finalize the execution in case of exception or normal return */
             free_generator_stack(ctx, s);
             return func_ret;
-        }
-        if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
+        } else {
+            assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
             /* get the returned yield value at the top of the stack */
             ret = sf->cur_sp[-1];
             sf->cur_sp[-1] = JS_UNDEFINED;
@@ -20665,12 +20775,6 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
             } else {
                 *pdone = false;
             }
-        } else {
-            /* end of iterator */
-            ret = sf->cur_sp[-1];
-            sf->cur_sp[-1] = JS_UNDEFINED;
-            JS_FreeValue(ctx, func_ret);
-            free_generator_stack(ctx, s);
         }
         break;
     case JS_GENERATOR_STATE_COMPLETED:
@@ -20708,13 +20812,14 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
     if (!s)
         return JS_EXCEPTION;
     s->state = JS_GENERATOR_STATE_SUSPENDED_START;
-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
+    s->func_state = async_func_init(ctx, func_obj, this_obj, argc, argv);
+    if (!s->func_state) {
         s->state = JS_GENERATOR_STATE_COMPLETED;
         goto fail;
     }
 
     /* execute the function up to 'OP_initial_yield' */
-    func_ret = async_func_resume(ctx, &s->func_state);
+    func_ret = async_func_resume(ctx, s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
@@ -20732,37 +20837,13 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
 
 /* AsyncFunction */
 
-static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-{
-    if (s->is_active) {
-        async_func_free(rt, &s->func_state);
-        s->is_active = false;
-    }
-}
-
-static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s)
-{
-    js_async_function_terminate(rt, s);
-    JS_FreeValueRT(rt, s->resolving_funcs[0]);
-    JS_FreeValueRT(rt, s->resolving_funcs[1]);
-    remove_gc_object(&s->header);
-    js_free_rt(rt, s);
-}
-
-static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s)
-{
-    if (--s->header.ref_count == 0) {
-        js_async_function_free0(rt, s);
-    }
-}
-
 static void js_async_function_resolve_finalizer(JSRuntime *rt,
                                                 JSValueConst val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
-    JSAsyncFunctionData *s = p->u.async_function_data;
+    JSAsyncFunctionState *s = p->u.async_function_data;
     if (s) {
-        js_async_function_free(rt, s);
+        async_func_free(rt, s);
     }
 }
 
@@ -20770,14 +20851,14 @@ static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
                                            JS_MarkFunc *mark_func)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
-    JSAsyncFunctionData *s = p->u.async_function_data;
+    JSAsyncFunctionState *s = p->u.async_function_data;
     if (s) {
         mark_func(rt, &s->header);
     }
 }
 
 static int js_async_function_resolve_create(JSContext *ctx,
-                                            JSAsyncFunctionData *s,
+                                            JSAsyncFunctionState *s,
                                             JSValue *resolving_funcs)
 {
     int i;
@@ -20799,71 +20880,71 @@ static int js_async_function_resolve_create(JSContext *ctx,
     return 0;
 }
 
-static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
     bool is_success = true;
     JSValue func_ret, ret2;
 
-    func_ret = async_func_resume(ctx, &s->func_state);
-    if (JS_IsException(func_ret)) {
-    fail:
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
-            is_success = false;
-        } else {
-            JSValue error = JS_GetException(ctx);
-            ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
-                           1, vc(&error));
-            JS_FreeValue(ctx, error);
-        resolved:
-            if (unlikely(JS_IsException(ret2))) {
-                if (JS_IsUncatchableError(ctx->rt->current_exception)) {
-                    is_success = false;
-                } else {
-                    abort(); /* BUG */
+    func_ret = async_func_resume(ctx, s);
+    if (s->is_completed) {
+        /* the stack frame has already been torn down by async_func_resume() */
+        if (JS_IsException(func_ret)) {
+        fail:
+            if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+                is_success = false;
+            } else {
+                JSValue error = JS_GetException(ctx);
+                ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
+                               1, vc(&error));
+                JS_FreeValue(ctx, error);
+            resolved:
+                if (unlikely(JS_IsException(ret2))) {
+                    if (JS_IsUncatchableError(ctx->rt->current_exception)) {
+                        is_success = false;
+                    } else {
+                        abort(); /* BUG */
+                    }
                 }
+                JS_FreeValue(ctx, ret2);
             }
-            JS_FreeValue(ctx, ret2);
-        }
-        js_async_function_terminate(ctx->rt, s);
-    } else {
-        JSValue value;
-        value = s->func_state.frame.cur_sp[-1];
-        s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
-        if (JS_IsUndefined(func_ret)) {
-            /* function returned */
-            ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
-                           1, vc(&value));
-            JS_FreeValue(ctx, value);
-            goto resolved;
         } else {
-            JSValue promise, resolving_funcs[2], resolving_funcs1[2];
-            int i, res;
-
-            /* await */
-            JS_FreeValue(ctx, func_ret); /* not used */
-            promise = js_promise_resolve(ctx, ctx->promise_ctor,
-                                         1, vc(&value), 0);
-            JS_FreeValue(ctx, value);
-            if (JS_IsException(promise))
-                goto fail;
-            if (js_async_function_resolve_create(ctx, s, resolving_funcs)) {
-                JS_FreeValue(ctx, promise);
-                goto fail;
-            }
-
-            /* Note: no need to create 'thrownawayCapability' as in
-               the spec */
-            for(i = 0; i < 2; i++)
-                resolving_funcs1[i] = JS_UNDEFINED;
-            res = perform_promise_then(ctx, promise,
-                                       vc(resolving_funcs),
-                                       vc(resolving_funcs1));
-            JS_FreeValue(ctx, promise);
-            for(i = 0; i < 2; i++)
-                JS_FreeValue(ctx, resolving_funcs[i]);
-            if (res)
-                goto fail;
+            /* function returned: func_ret holds the return value */
+            ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
+                           1, vc(&func_ret));
+            JS_FreeValue(ctx, func_ret);
+            goto resolved;
         }
+    } else {
+        JSValue value, promise, resolving_funcs[2], resolving_funcs1[2];
+        int i, res;
+
+        value = s->frame.cur_sp[-1];
+        s->frame.cur_sp[-1] = JS_UNDEFINED;
+
+        /* await */
+        JS_FreeValue(ctx, func_ret); /* not used */
+        promise = js_promise_resolve(ctx, ctx->promise_ctor,
+                                     1, vc(&value), 0);
+        JS_FreeValue(ctx, value);
+        if (JS_IsException(promise))
+            goto fail;
+        if (js_async_function_resolve_create(ctx, s, resolving_funcs)) {
+            JS_FreeValue(ctx, promise);
+            goto fail;
+        }
+
+        /* Note: no need to create 'thrownawayCapability' as in
+           the spec */
+        for(i = 0; i < 2; i++)
+            resolving_funcs1[i] = JS_UNDEFINED;
+        res = perform_promise_then(ctx, promise,
+                                   vc(resolving_funcs),
+                                   vc(resolving_funcs1));
+        JS_FreeValue(ctx, promise);
+        for(i = 0; i < 2; i++)
+            JS_FreeValue(ctx, resolving_funcs[i]);
+        if (res)
+            goto fail;
     }
     return is_success;
 }
@@ -20875,7 +20956,7 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
                                               int flags)
 {
     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
-    JSAsyncFunctionData *s = p->u.async_function_data;
+    JSAsyncFunctionState *s = p->u.async_function_data;
     bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
     JSValueConst arg;
 
@@ -20883,12 +20964,12 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
         arg = argv[0];
     else
         arg = JS_UNDEFINED;
-    s->func_state.throw_flag = is_reject;
+    s->throw_flag = is_reject;
     if (is_reject) {
         JS_Throw(ctx, js_dup(arg));
     } else {
         /* return value of await */
-        s->func_state.frame.cur_sp[-1] = js_dup(arg);
+        s->frame.cur_sp[-1] = js_dup(arg);
     }
     if (!js_async_function_resume(ctx, s))
         return JS_EXCEPTION;
@@ -20900,33 +20981,26 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
                                       int argc, JSValueConst *argv, int flags)
 {
     JSValue promise;
-    JSAsyncFunctionData *s;
+    JSAsyncFunctionState *s;
 
-    s = js_mallocz(ctx, sizeof(*s));
+    s = async_func_init(ctx, func_obj, this_obj, argc, argv);
     if (!s)
         return JS_EXCEPTION;
-    s->header.ref_count = 1;
-    add_gc_object(ctx->rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
-    s->is_active = false;
-    s->resolving_funcs[0] = JS_UNDEFINED;
-    s->resolving_funcs[1] = JS_UNDEFINED;
 
     promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
-    if (JS_IsException(promise))
-        goto fail;
-
-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
-    fail:
-        JS_FreeValue(ctx, promise);
-        js_async_function_free(ctx->rt, s);
+    if (JS_IsException(promise)) {
+        async_func_free(ctx->rt, s);
         return JS_EXCEPTION;
     }
-    s->is_active = true;
 
-    if (!js_async_function_resume(ctx, s))
-        goto fail;
+    if (!js_async_function_resume(ctx, s)) {
+        /* uncatchable error: propagate it */
+        JS_FreeValue(ctx, promise);
+        async_func_free(ctx->rt, s);
+        return JS_EXCEPTION;
+    }
 
-    js_async_function_free(ctx->rt, s);
+    async_func_free(ctx->rt, s);
 
     return promise;
 }
@@ -20955,7 +21029,8 @@ typedef struct JSAsyncGeneratorRequest {
 typedef struct JSAsyncGeneratorData {
     JSObject *generator; /* back pointer to the object (const) */
     JSAsyncGeneratorStateEnum state;
-    JSAsyncFunctionState func_state;
+    /* func_state is NULL in the AWAITING_RETURN and COMPLETED states */
+    JSAsyncFunctionState *func_state;
     struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
 } JSAsyncGeneratorData;
 
@@ -20973,10 +21048,8 @@ static void js_async_generator_free(JSRuntime *rt,
         JS_FreeValueRT(rt, req->resolving_funcs[1]);
         js_free_rt(rt, req);
     }
-    if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
-        s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
-        async_func_free(rt, &s->func_state);
-    }
+    if (s->func_state)
+        async_func_free(rt, s->func_state);
     js_free_rt(rt, s);
 }
 
@@ -21003,9 +21076,8 @@ static void js_async_generator_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
         }
-        if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
-            s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
-            async_func_mark(rt, &s->func_state, mark_func);
+        if (s->func_state) {
+            mark_func(rt, &s->func_state->header);
         }
     }
 }
@@ -21115,7 +21187,8 @@ static void js_async_generator_complete(JSContext *ctx,
 {
     if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
-        async_func_free(ctx->rt, &s->func_state);
+        async_func_free(ctx->rt, s->func_state);
+        s->func_state = NULL;
     }
 }
 
@@ -21196,30 +21269,38 @@ static void js_async_generator_resume_next(JSContext *ctx,
             if (next->completion_type == GEN_MAGIC_THROW &&
                 s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                 JS_Throw(ctx, value);
-                s->func_state.throw_flag = true;
+                s->func_state->throw_flag = true;
             } else {
                 /* 'yield' returns a value. 'yield *' also returns a value
                    in case the 'throw' method is called */
-                s->func_state.frame.cur_sp[-1] = value;
-                s->func_state.frame.cur_sp[0] =
+                s->func_state->frame.cur_sp[-1] = value;
+                s->func_state->frame.cur_sp[0] =
                     js_int32(next->completion_type);
-                s->func_state.frame.cur_sp++;
+                s->func_state->frame.cur_sp++;
             exec_no_arg:
-                s->func_state.throw_flag = false;
+                s->func_state->throw_flag = false;
             }
             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
         resume_exec:
-            func_ret = async_func_resume(ctx, &s->func_state);
-            if (JS_IsException(func_ret)) {
-                value = JS_GetException(ctx);
-                js_async_generator_complete(ctx, s);
-                js_async_generator_reject(ctx, s, value);
-                JS_FreeValue(ctx, value);
-            } else if (JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT) {
+            func_ret = async_func_resume(ctx, s->func_state);
+            if (s->func_state->is_completed) {
+                if (JS_IsException(func_ret)) {
+                    value = JS_GetException(ctx);
+                    js_async_generator_complete(ctx, s);
+                    js_async_generator_reject(ctx, s, value);
+                    JS_FreeValue(ctx, value);
+                } else {
+                    /* end of function: func_ret holds the return value */
+                    js_async_generator_complete(ctx, s);
+                    js_async_generator_resolve(ctx, s, func_ret, true);
+                    JS_FreeValue(ctx, func_ret);
+                }
+            } else {
                 int func_ret_code, ret;
-                value = s->func_state.frame.cur_sp[-1];
-                s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+                assert(JS_VALUE_GET_TAG(func_ret) == JS_TAG_INT);
                 func_ret_code = JS_VALUE_GET_INT(func_ret);
+                value = s->func_state->frame.cur_sp[-1];
+                s->func_state->frame.cur_sp[-1] = JS_UNDEFINED;
                 switch(func_ret_code) {
                 case FUNC_RET_YIELD:
                 case FUNC_RET_YIELD_STAR:
@@ -21235,21 +21316,13 @@ static void js_async_generator_resume_next(JSContext *ctx,
                     JS_FreeValue(ctx, value);
                     if (ret < 0) {
                         /* exception: throw it */
-                        s->func_state.throw_flag = true;
+                        s->func_state->throw_flag = true;
                         goto resume_exec;
                     }
                     goto done;
                 default:
                     abort();
                 }
-            } else {
-                assert(JS_IsUndefined(func_ret));
-                /* end of function */
-                value = s->func_state.frame.cur_sp[-1];
-                s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
-                js_async_generator_complete(ctx, s);
-                js_async_generator_resolve(ctx, s, value, true);
-                JS_FreeValue(ctx, value);
             }
             break;
         default:
@@ -21282,12 +21355,12 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
         }
     } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
         /* restart function execution after await() */
-        s->func_state.throw_flag = is_reject;
+        s->func_state->throw_flag = is_reject;
         if (is_reject) {
             JS_Throw(ctx, js_dup(arg));
         } else {
             /* return value of await */
-            s->func_state.frame.cur_sp[-1] = js_dup(arg);
+            s->func_state->frame.cur_sp[-1] = js_dup(arg);
         }
         js_async_generator_resume_next(ctx, s);
     }
@@ -21352,14 +21425,15 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
         return JS_EXCEPTION;
     s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
     init_list_head(&s->queue);
-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
+    s->func_state = async_func_init(ctx, func_obj, this_obj, argc, argv);
+    if (!s->func_state) {
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
         goto fail;
     }
 
     /* execute the function up to 'OP_initial_yield' (no yield nor
        await are possible) */
-    func_ret = async_func_resume(ctx, &s->func_state);
+    func_ret = async_func_resume(ctx, s->func_state);
     if (JS_IsException(func_ret))
         goto fail;
     JS_FreeValue(ctx, func_ret);
@@ -53347,7 +53421,7 @@ static JSValueConst js_promise_function_promise(JSValueConst func)
 static JSValueConst js_promise_reaction_promise(JSValueConst func)
 {
     JSObject *p;
-    JSAsyncFunctionData *s;
+    JSAsyncFunctionState *s;
     JSValueConst promise;
 
     promise = js_promise_function_promise(func);
