@@ -20562,10 +20562,30 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
 {
     JSStackFrame *sf = &s->frame;
     JSValue *sp;
+    int i;
 
     if (sf->arg_buf) {
         /* cannot free the function if it is running */
         assert(sf->cur_sp != NULL);
+        /* If the frame is being torn down without close_var_refs() having
+           run (i.e. the state is GC'd while still incomplete, e.g. an async
+           generator collected as part of a cycle), any still-open closure
+           var_refs point into this frame: their var_refs[] back-pointer slot
+           lives inside arg_buf and their async_func back-pointer references
+           the state being freed. Neutralize them into detached, empty refs so
+           their eventual free_var_ref() touches neither the freed frame nor
+           the freed async state. The captured value lives in the frame slot
+           and is released by the arg_buf teardown below, so it is not dup'd
+           here (matching the "do not mutate the object graph" constraint of
+           cycle collection). */
+        for(i = 0; i < sf->var_ref_count; i++) {
+            JSVarRef *var_ref = sf->var_refs[i];
+            if (var_ref && !var_ref->is_detached) {
+                var_ref->value = JS_UNDEFINED;
+                var_ref->pvalue = &var_ref->value;
+                var_ref->is_detached = true;
+            }
+        }
         for(sp = sf->arg_buf; sp < sf->cur_sp; sp++) {
             JS_FreeValueRT(rt, *sp);
         }
