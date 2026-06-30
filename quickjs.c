@@ -17370,9 +17370,10 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
 
 static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
-    /* release the counted reference to the async function state before the
-       union is overwritten with 'value' (async_func and value alias). The
-       var_ref is already a GC object (added when it was created open). */
+    /* the var_ref is transitioning to detached mode; the open-frame fields
+       (incl. async_func) are no longer used afterwards, so release the counted
+       reference to the async function state now. The var_ref is already a GC
+       object (added when it was created open). */
     if (var_ref->async_func)
         async_func_free(rt, var_ref->async_func);
     var_ref->value = js_dup(*var_ref->pvalue);
