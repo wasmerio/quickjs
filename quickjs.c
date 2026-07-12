@@ -21567,6 +21567,7 @@ typedef struct BlockEnv {
     int label_finally; /* -1 if none */
     int scope_level;
     uint8_t has_iterator : 1;
+    uint8_t is_async_iterator : 1;
     uint8_t is_regular_stmt : 1; // i.e. not a loop statement
 } BlockEnv;
 
@@ -27870,6 +27871,7 @@ static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
     be->label_finally = -1;
     be->scope_level = fd->scope_level;
     be->has_iterator = false;
+    be->is_async_iterator = false;
     be->is_regular_stmt = false;
 }
 
@@ -27878,6 +27880,53 @@ static void pop_break_entry(JSFunctionDef *fd)
     BlockEnv *be;
     be = fd->top_break;
     fd->top_break = be->prev;
+}
+
+/* stack: iter_obj next catch_offset -> */
+static void emit_iterator_close(JSParseState *s, BlockEnv *top)
+{
+    int label_done;
+
+    if (!top->is_async_iterator) {
+        emit_op(s, OP_iterator_close);
+        return;
+    }
+
+    emit_op(s, OP_undefined); /* dummy argument slot for OP_iterator_call */
+    emit_op(s, OP_iterator_call);
+    emit_u8(s, 2); /* return with no argument */
+    label_done = emit_goto(s, OP_if_true, -1);
+    emit_op(s, OP_await);
+    emit_op(s, OP_iterator_check_object);
+    emit_label(s, label_done);
+    emit_op(s, OP_drop); /* return result or dummy value */
+    emit_op(s, OP_drop); /* catch offset */
+    emit_op(s, OP_drop); /* next method */
+    emit_op(s, OP_drop); /* iterator object */
+}
+
+/* stack: iter_obj next ret_val -> ret_val */
+static void emit_async_iterator_return_close(JSParseState *s)
+{
+    int label_next, label_next2;
+
+    emit_op(s, OP_nip); /* next */
+    emit_op(s, OP_swap);
+    emit_op(s, OP_get_field2);
+    emit_atom(s, JS_ATOM_return);
+    /* stack: ret_val iter_obj return_func */
+    emit_op(s, OP_dup);
+    emit_op(s, OP_is_undefined_or_null);
+    label_next = emit_goto(s, OP_if_true, -1);
+    emit_op(s, OP_call_method);
+    emit_u16(s, 0);
+    emit_op(s, OP_iterator_check_object);
+    emit_op(s, OP_await);
+    label_next2 = emit_goto(s, OP_goto, -1);
+    emit_label(s, label_next);
+    emit_op(s, OP_drop);
+    emit_label(s, label_next2);
+    emit_op(s, OP_drop);
 }
 
 static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont)
@@ -27906,7 +27955,7 @@ static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont)
         }
         i = 0;
         if (top->has_iterator) {
-            emit_op(s, OP_iterator_close);
+            emit_iterator_close(s, top);
             i += 3;
         }
         for(; i < top->drop_count; i++)
@@ -27960,25 +28009,8 @@ static void emit_return(JSParseState *s, bool hasval)
             emit_op(s, OP_nip_catch);
             /* stack: iter_obj next ret_val */
             if (top->has_iterator) {
-                if (s->cur_func->func_kind == JS_FUNC_ASYNC_GENERATOR) {
-                    int label_next, label_next2;
-                    emit_op(s, OP_nip); /* next */
-                    emit_op(s, OP_swap);
-                    emit_op(s, OP_get_field2);
-                    emit_atom(s, JS_ATOM_return);
-                    /* stack: iter_obj return_func */
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_is_undefined_or_null);
-                    label_next = emit_goto(s, OP_if_true, -1);
-                    emit_op(s, OP_call_method);
-                    emit_u16(s, 0);
-                    emit_op(s, OP_iterator_check_object);
-                    emit_op(s, OP_await);
-                    label_next2 = emit_goto(s, OP_goto, -1);
-                    emit_label(s, label_next);
-                    emit_op(s, OP_drop);
-                    emit_label(s, label_next2);
-                    emit_op(s, OP_drop);
+                if (top->is_async_iterator) {
+                    emit_async_iterator_return_close(s);
                 } else {
                     emit_op(s, OP_rot3r);
                     emit_op(s, OP_undefined); /* dummy catch offset */
@@ -28206,6 +28238,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     bool has_initializer, is_for_of, has_destructuring;
     int tok, tok1, opcode, scope, block_scope_level;
     int label_next, label_expr, label_cont, label_body, label_break;
+    int label_done, label_end;
     int pos_next, pos_expr;
     BlockEnv break_entry;
 
@@ -28217,6 +28250,8 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     label_body = new_label(s);
     label_break = new_label(s);
     label_next = new_label(s);
+    label_done = new_label(s);
+    label_end = new_label(s);
 
     /* create scope for the lexical variables declared in the enumeration
        expressions. XXX: Not completely correct because of weird capturing
@@ -28347,6 +28382,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
            that a yield in the expression does not try to close a
            not-yet-created iterator */
         break_entry.has_iterator = true;
+        break_entry.is_async_iterator = is_async;
         break_entry.drop_count += 2;
         if (is_async)
             emit_op(s, OP_for_await_of_start);
@@ -28412,11 +28448,19 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     emit_goto(s, OP_if_false, label_next);
     /* drop the undefined value from for_xx_next */
     emit_op(s, OP_drop);
+    if (is_for_of)
+        emit_goto(s, OP_goto, label_done);
 
     emit_label(s, label_break);
     if (is_for_of) {
         /* close and drop enum_rec */
-        emit_op(s, OP_iterator_close);
+        emit_iterator_close(s, &break_entry);
+        emit_goto(s, OP_goto, label_end);
+        emit_label(s, label_done);
+        emit_op(s, OP_drop);
+        emit_op(s, OP_drop);
+        emit_op(s, OP_drop);
+        emit_label(s, label_end);
     } else {
         emit_op(s, OP_drop);
     }
