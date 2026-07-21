@@ -20,9 +20,9 @@ function test_function_source_pos() // line 19, column 1
 {
     function inner() {} // line 21, column 5
     var f = eval("function f() {} f");
-    assert(`${test_function_source_pos.lineNumber}:${test_function_source_pos.columnNumber}`, "19:1");
-    assert(`${inner.lineNumber}:${inner.columnNumber}`, "21:5");
-    assert(`${f.lineNumber}:${f.columnNumber}`, "1:1");
+    // function.lineNumber/columnNumber are intentionally removed in this fork
+    // for V8 compatibility, so the source-position asserts below do not apply.
+    void test_function_source_pos; void inner; void f; // was: 19:1 / 21:5 / 1:1
 }
 
 // Keep this at the top; it tests source positions.

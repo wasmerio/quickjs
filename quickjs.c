@@ -20955,7 +20955,10 @@ static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
     *pdone = true;
     if (!s)
         return JS_ThrowTypeError(ctx, "not a generator");
-    sf = &s->func_state->frame;
+    /* func_state is NULL in the AWAITING_RETURN and COMPLETED states, where sf
+       is never dereferenced; only form the frame pointer when it is live to
+       avoid a null member access (flagged by UBSAN). */
+    sf = s->func_state ? &s->func_state->frame : NULL;
     switch(s->state) {
     default:
     case JS_GENERATOR_STATE_SUSPENDED_START:
@@ -30980,7 +30983,11 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
 
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
-        if (js_create_module_function(ctx, rme->module) < 0)
+        /* rme->module stays NULL for a dependency that has not been resolved
+           yet; skip it here (it is instantiated when it resolves) rather than
+           recursing with a null module (a null member access, flagged by
+           UBSAN). */
+        if (rme->module && js_create_module_function(ctx, rme->module) < 0)
             return -1;
     }
 
