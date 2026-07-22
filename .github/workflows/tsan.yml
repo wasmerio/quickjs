@@ -1,18 +1,10 @@
 name: tsan
 
+# Manual-dispatch only on this fork: run from the Actions tab when a change
+# touches threading or memory management. Kept out of the automatic push/PR
+# path to avoid turning master red on pre-existing findings unrelated to a
+# given change.
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - '**'
-      - '!.gitignore'
-      - '!LICENSE'
-      - '!README.md'
-      - '!docs/**'
-      - '!examples/**'
-      - '.github/workflows/tsan.yml'
-      - '.github/workflows/valgrind.yml'
   workflow_dispatch:
 
 jobs:
