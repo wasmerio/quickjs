@@ -166,6 +166,49 @@ function test_exception_capture_stack_trace_filter()
   assert(!o.stack.includes('log_stack'));
 }
 
+function test_exception_derived_constructor_stack_filter()
+{
+  class DerivedError extends Error {}
+
+  const makeError = () => new DerivedError('boom');
+  const e = makeError();
+
+  assert(!e.stack.includes('DerivedError'));
+  assert(e.stack.includes('makeError'));
+
+  let preparedCode = null;
+  Error.prepareStackTrace = (error, frames) => {
+    preparedCode = error.code;
+    return frames.join('\n');
+  };
+  class CodedError extends Error { code = 'E_CODE'; }
+  const codedError = new CodedError('boom');
+  assert(preparedCode, null);
+  assert(codedError.code, 'E_CODE');
+  void codedError.stack;
+  assert(preparedCode, 'E_CODE');
+  Error.prepareStackTrace = undefined;
+
+  const receiver = {};
+  const anonymous = eval('(function() { return new Error(); })');
+  const receiverError = Reflect.apply(anonymous, receiver, []);
+  assert(receiverError.stack.includes('Object.<anonymous>'));
+
+  Error.prepareStackTrace = (_, frames) => frames;
+  const frame = Reflect.apply(anonymous, receiver, []).stack[0];
+  Error.prepareStackTrace = undefined;
+  assert(frame.getThis(), receiver);
+  assert(frame.getTypeName(), 'Object');
+  assert(frame.getFunctionName(), null);
+  assert(frame.toString().includes('Object.<anonymous>'));
+
+  const accessor = {
+    get value() { return new Error(); },
+  };
+  assert(accessor.value.stack.includes('at get value'));
+  assert(!accessor.value.stack.includes('Object.get value'));
+}
+
 function my_func(a, b)
 {
     return a + b;
@@ -1366,4 +1409,5 @@ test_exception_prepare_stack_data_property();
 test_exception_stack_size_limit();
 test_exception_capture_stack_trace();
 test_exception_capture_stack_trace_filter();
+test_exception_derived_constructor_stack_filter();
 test_cur_pc();

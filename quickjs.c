@@ -373,6 +373,7 @@ struct JSClass {
 typedef struct JSStackFrame {
     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
+    JSValue this_val; /* borrowed while synchronous; owned by async state */
     JSValue *arg_buf; /* arguments */
     JSValue *var_buf; /* variables */
     struct JSVarRef **var_refs; /* references to arguments or local variables */
@@ -1144,6 +1145,8 @@ typedef struct JSCallSiteData {
     JSValue filename;
     JSValue func;
     JSValue func_name;
+    JSValue this_val;
+    JSValue type_name;
     bool native;
     bool is_constructor;
     bool is_async;
@@ -6285,6 +6288,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = unsafe_unconst(this_val);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
@@ -6411,6 +6415,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = unsafe_unconst(this_val);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
@@ -7794,6 +7799,20 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
     return JS_ToCString(ctx, val);
 }
 
+/* Resolve the receiver's built-in type without running user code. */
+static const char *get_stack_frame_type_name(JSContext *ctx,
+                                             JSValueConst this_val)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(this_val);
+    if (p->class_id >= ctx->rt->class_count)
+        return NULL;
+    return JS_AtomToCString(ctx, ctx->rt->class_array[p->class_id].class_name);
+}
+
 /* Note: it is important that no exception is returned by this function */
 static bool can_add_backtrace(JSValueConst obj)
 {
@@ -7812,6 +7831,8 @@ static bool can_add_backtrace(JSValueConst obj)
 /* only taken into account if filename is provided */
 #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
 #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
+/* Select a starting frame without forcing capture onto an existing object. */
+#define JS_BACKTRACE_FLAG_FILTER_START     (1 << 3)
 
 static JSValue js_error_lazy_stack_getter(JSContext *ctx,
                                           JSValueConst this_val,
@@ -7873,7 +7894,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     const char *str1;
     JSObject *p;
     JSFunctionBytecode *b;
-    bool backtrace_barrier, has_prepare, has_filter_func, stack_property_defined;
+    bool backtrace_barrier, has_prepare, has_filter_func, filter_stack_start,
+         stack_property_defined;
     JSRuntime *rt;
     JSCallSiteData csd[64];
     uint32_t i;
@@ -7908,6 +7930,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     stack_trace_limit = max_int(stack_trace_limit, 0);
     has_prepare = false;
     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
+    filter_stack_start = backtrace_flags &
+                         (JS_BACKTRACE_FLAG_FILTER_FUNC |
+                          JS_BACKTRACE_FLAG_FILTER_START);
     stack_property_defined = false;
     i = 0;
     prepare = JS_UNDEFINED;
@@ -7959,7 +7984,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     /* Find the frame we want to start from. Note that when a filter is used the filter
        function will be the first, but we also specify we want to skip the first one. */
-    if (has_filter_func) {
+    if (filter_stack_start) {
         for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
             if (js_same_value(ctx, sf->cur_func, filter_func)) {
                 sf_start = sf;
@@ -7986,13 +8011,29 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         if (has_prepare) {
             js_new_callsite_data(ctx, &csd[i], sf);
         } else {
+            const char *type_name_str;
+
             /* func_name_str is UTF-8 encoded if needed */
             func_name_str = get_func_name(ctx, sf->cur_func);
-            if (!func_name_str || func_name_str[0] == '\0')
-                str1 = "<anonymous>";
-            else
-                str1 = func_name_str;
-            dbuf_printf(&dbuf, "    at %s", str1);
+            type_name_str = sf->is_constructor
+                                ? NULL
+                                : get_stack_frame_type_name(ctx, sf->this_val);
+            if (type_name_str && type_name_str[0] &&
+                !(func_name_str &&
+                  (!strncmp(func_name_str, "get ", 4) ||
+                   !strncmp(func_name_str, "set ", 4)))) {
+                str1 = func_name_str && func_name_str[0]
+                           ? func_name_str
+                           : "<anonymous>";
+                dbuf_printf(&dbuf, "    at %s.%s", type_name_str, str1);
+            } else {
+                if (!func_name_str || func_name_str[0] == '\0')
+                    str1 = "<anonymous>";
+                else
+                    str1 = func_name_str;
+                dbuf_printf(&dbuf, "    at %s", str1);
+            }
+            JS_FreeCString(ctx, type_name_str);
             JS_FreeCString(ctx, func_name_str);
 
             if (b && sf->cur_pc) {
@@ -8045,7 +8086,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         for (k = j; k < i; k++) {
             js_callsite_free_data(ctx, &csd[k]);
         }
-        if (!JS_IsNull(stack) && (has_filter_func || can_add_backtrace(error_obj))) {
+        if (!JS_IsNull(stack) && (filter_stack_start || can_add_backtrace(error_obj))) {
             JSValueConst data[] = { prepare, stack };
             JSValue getter = JS_NewCFunctionData2(ctx, js_error_lazy_stack_getter,
                                                   "get stack", 0, 0,
@@ -8059,12 +8100,22 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                 if (JS_IsException(setter)) {
                     JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
                     JS_FreeValue(ctx, getter);
-                } else if (JS_DefinePropertyGetSet(ctx, error_obj, JS_ATOM_stack,
-                                                   getter, setter,
-                                                   JS_PROP_CONFIGURABLE) == 0) {
-                    stack_property_defined = true;
                 } else {
-                    JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+                    int ret = JS_DefineProperty(ctx, error_obj, JS_ATOM_stack,
+                                                JS_UNDEFINED, getter, setter,
+                                                JS_PROP_HAS_GET |
+                                                JS_PROP_HAS_SET |
+                                                JS_PROP_HAS_CONFIGURABLE |
+                                                JS_PROP_HAS_ENUMERABLE |
+                                                JS_PROP_CONFIGURABLE |
+                                                JS_PROP_NO_EXOTIC);
+                    JS_FreeValue(ctx, getter);
+                    JS_FreeValue(ctx, setter);
+                    if (ret == 1) {
+                        stack_property_defined = true;
+                    } else {
+                        JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+                    }
                 }
             }
         }
@@ -8096,7 +8147,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (!stack_property_defined) {
         if (JS_IsUndefined(ctx->error_back_trace))
             ctx->error_back_trace = js_dup(stack);
-        if (has_filter_func || can_add_backtrace(error_obj)) {
+        if (filter_stack_start || can_add_backtrace(error_obj)) {
             JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
         } else {
@@ -17547,6 +17598,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = unsafe_unconst(this_obj);
     sf->arg_count = argc;
     sf->async_func = NULL; /* not an async function frame */
     arg_buf = argv;
@@ -17817,6 +17869,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     arg_buf = (JSValue *)argv;
     sf->arg_count = argc;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_val = unsafe_unconst(this_obj);
     var_refs = p->u.func.var_refs;
 
     local_buf = alloca(alloca_size);
@@ -20760,6 +20813,7 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
     }
     sf->cur_func = js_dup(func_obj);
     s->this_val = js_dup(this_obj);
+    sf->this_val = s->this_val;
     s->argc = argc;
     sf->arg_count = arg_buf_len;
     sf->var_buf = sf->arg_buf + arg_buf_len;
@@ -42566,8 +42620,16 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
 
-    /* skip the Error() function in the backtrace */
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    /*
+     * Skip the constructor that created the error.  For a direct Error()
+     * call this preserves the existing behavior of skipping the native
+     * constructor frame.  For a derived error, new_target identifies the
+     * JavaScript constructor whose super() call reached us, so filtering on
+     * it also removes the derived constructor frame.
+     */
+    build_backtrace(ctx, obj, new_target, NULL, 0, 0,
+                    JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL |
+                    JS_BACKTRACE_FLAG_FILTER_START);
     return obj;
  exception:
     JS_FreeValue(ctx, obj);
@@ -62909,6 +62971,8 @@ static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, csd->filename);
         JS_FreeValueRT(rt, csd->func);
         JS_FreeValueRT(rt, csd->func_name);
+        JS_FreeValueRT(rt, csd->this_val);
+        JS_FreeValueRT(rt, csd->type_name);
         js_free_rt(rt, csd);
     }
 }
@@ -62921,6 +62985,8 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, csd->filename, mark_func);
         JS_MarkValue(rt, csd->func, mark_func);
         JS_MarkValue(rt, csd->func_name, mark_func);
+        JS_MarkValue(rt, csd->this_val, mark_func);
+        JS_MarkValue(rt, csd->type_name, mark_func);
     }
 }
 
@@ -62929,6 +62995,8 @@ static void js_callsite_init_data(JSCallSiteData *csd)
     csd->filename = JS_NULL;
     csd->func = JS_NULL;
     csd->func_name = JS_NULL;
+    csd->this_val = JS_NULL;
+    csd->type_name = JS_NULL;
     csd->native = false;
     csd->is_constructor = false;
     csd->is_async = false;
@@ -62942,6 +63010,8 @@ static void js_callsite_free_data(JSContext *ctx, JSCallSiteData *csd)
     JS_FreeValue(ctx, csd->filename);
     JS_FreeValue(ctx, csd->func);
     JS_FreeValue(ctx, csd->func_name);
+    JS_FreeValue(ctx, csd->this_val);
+    JS_FreeValue(ctx, csd->type_name);
 }
 
 static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd) {
@@ -62969,6 +63039,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
 
     js_callsite_init_data(csd);
     csd->func = js_dup(sf->cur_func);
+    csd->this_val = js_dup(sf->this_val);
     /* func_name_str is UTF-8 encoded if needed */
     func_name_str = get_func_name(ctx, sf->cur_func);
     if (!func_name_str || func_name_str[0] == '\0')
@@ -62978,6 +63049,13 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
     JS_FreeCString(ctx, func_name_str);
     if (JS_IsException(csd->func_name))
         csd->func_name = JS_NULL;
+    const char *type_name_str = get_stack_frame_type_name(ctx, sf->this_val);
+    if (type_name_str != NULL) {
+        csd->type_name = JS_NewString(ctx, type_name_str);
+        JS_FreeCString(ctx, type_name_str);
+        if (JS_IsException(csd->type_name))
+            csd->type_name = JS_NULL;
+    }
     csd->is_constructor = sf->is_constructor;
     if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT) {
         csd->native = true;
@@ -63094,7 +63172,7 @@ static JSValue js_callsite_toString(JSContext *ctx, JSValueConst this_val, int a
 {
     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
     DynBuf dbuf;
-    const char *filename = NULL, *func_name = NULL;
+    const char *filename = NULL, *func_name = NULL, *type_name = NULL;
     if (!csd)
         return JS_EXCEPTION;
 
@@ -63102,10 +63180,18 @@ static JSValue js_callsite_toString(JSContext *ctx, JSValueConst this_val, int a
         filename = JS_ToCString(ctx, csd->filename);
     if (JS_IsString(csd->func_name))
         func_name = JS_ToCString(ctx, csd->func_name);
+    if (JS_IsString(csd->type_name))
+        type_name = JS_ToCString(ctx, csd->type_name);
 
     js_dbuf_init(ctx, &dbuf);
     if (csd->is_constructor)
         dbuf_putstr(&dbuf, "new ");
+    if (!csd->is_constructor && type_name && type_name[0] &&
+        !(func_name &&
+          (!strncmp(func_name, "get ", 4) || !strncmp(func_name, "set ", 4)))) {
+        dbuf_putstr(&dbuf, type_name);
+        dbuf_putc(&dbuf, '.');
+    }
     dbuf_putstr(&dbuf, func_name && func_name[0] ? func_name : "<anonymous>");
     if (filename && filename[0]) {
         dbuf_printf(&dbuf, " (%s", filename);
@@ -63120,6 +63206,7 @@ static JSValue js_callsite_toString(JSContext *ctx, JSValueConst this_val, int a
 
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, func_name);
+    JS_FreeCString(ctx, type_name);
     if (dbuf_error(&dbuf)) {
         dbuf_free(&dbuf);
         return JS_EXCEPTION;
@@ -63143,8 +63230,8 @@ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
-    JS_CFUNC_DEF("getThis", 0, js_callsite_null),
-    JS_CFUNC_DEF("getTypeName", 0, js_callsite_null),
+    JS_CFUNC_MAGIC_DEF("getThis", 0, js_callsite_getfield, offsetof(JSCallSiteData, this_val)),
+    JS_CFUNC_MAGIC_DEF("getTypeName", 0, js_callsite_getfield, offsetof(JSCallSiteData, type_name)),
     JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_null),
     JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_null),
     JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_null),
