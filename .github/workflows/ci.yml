@@ -47,7 +47,7 @@ jobs:
           - { os: macos-14, configType: Debug }
           - { os: macos-14, configType: asan+ubsan }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: true
 

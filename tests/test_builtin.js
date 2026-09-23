@@ -166,6 +166,49 @@ function test_exception_capture_stack_trace_filter()
   assert(!o.stack.includes('log_stack'));
 }
 
+function test_exception_derived_constructor_stack_filter()
+{
+  class DerivedError extends Error {}
+
+  const makeError = () => new DerivedError('boom');
+  const e = makeError();
+
+  assert(!e.stack.includes('DerivedError'));
+  assert(e.stack.includes('makeError'));
+
+  let preparedCode = null;
+  Error.prepareStackTrace = (error, frames) => {
+    preparedCode = error.code;
+    return frames.join('\n');
+  };
+  class CodedError extends Error { code = 'E_CODE'; }
+  const codedError = new CodedError('boom');
+  assert(preparedCode, null);
+  assert(codedError.code, 'E_CODE');
+  void codedError.stack;
+  assert(preparedCode, 'E_CODE');
+  Error.prepareStackTrace = undefined;
+
+  const receiver = {};
+  const anonymous = eval('(function() { return new Error(); })');
+  const receiverError = Reflect.apply(anonymous, receiver, []);
+  assert(receiverError.stack.includes('Object.<anonymous>'));
+
+  Error.prepareStackTrace = (_, frames) => frames;
+  const frame = Reflect.apply(anonymous, receiver, []).stack[0];
+  Error.prepareStackTrace = undefined;
+  assert(frame.getThis(), receiver);
+  assert(frame.getTypeName(), 'Object');
+  assert(frame.getFunctionName(), null);
+  assert(frame.toString().includes('Object.<anonymous>'));
+
+  const accessor = {
+    get value() { return new Error(); },
+  };
+  assert(accessor.value.stack.includes('at get value'));
+  assert(!accessor.value.stack.includes('Object.get value'));
+}
+
 function my_func(a, b)
 {
     return a + b;
@@ -700,8 +743,11 @@ function test_typed_array()
     };
     b = a.slice();
     assert(a.buffer, b.buffer);
-    assert(a.toString(), "0,0,0,255");
-    assert(b.toString(), "0,0,255,255");
+    // the copy is byte by byte in increasing order, so bytes already
+    // copied are read back as source values when the target overlaps
+    // the source ahead of it
+    assert(a.toString(), "0,0,0,0");
+    assert(b.toString(), "0,0,0,0");
 
     const TypedArray = class extends Object.getPrototypeOf(Uint8Array) {};
     let caught = false;
@@ -759,9 +805,9 @@ function test_typed_array()
     assert(ta[0], 0);
     Object.defineProperty(ta, "0", {value: 1337});
     assert(ta[0], 0);
-    assert(desc.writable, false);
+    assert(desc.writable, true);
     assert(desc.enumerable, true);
-    assert(desc.configurable, false);
+    assert(desc.configurable, true);
 }
 
 function test_json()
@@ -787,6 +833,18 @@ function test_json()
   3
  ]
 ]`);
+
+    /* the space argument can be a rope, which is not a JSString: it must be
+       linearized before its characters are read, else the gap is filled with
+       the raw bytes of the rope's internal JSValues */
+    var rope = "a".repeat(600) + "b".repeat(600);
+    var expected = '{\n' + "a".repeat(10) + '"x": 1\n}';
+    assert(JSON.stringify({x:1}, null, rope), expected);
+    assert(JSON.stringify({x:1}, null, new String(rope)), expected);
+    /* wide char rope */
+    var wide = "é".repeat(600) + "è".repeat(600);
+    assert(JSON.stringify({x:1}, null, wide),
+           '{\n' + "é".repeat(10) + '"x": 1\n}');
 }
 
 function test_date()
@@ -961,7 +1019,7 @@ function test_regexp()
     } catch (_ex) {
         ex = _ex;
     }
-    assert(ex?.message, "invalid class range");
+    assert(ex?.message, "invalid character in class in regular expression");
 
     eval("/[\\-]/");
     eval("/[\\-]/u");
@@ -1248,6 +1306,31 @@ function test_proxy_iter()
     assert(a[1], "y");
 }
 
+function test_proxy_own_keys_huge_length()
+{
+    for (const length of [0x20000000, 0x40000000, 0xfffffffe, 0xffffffff]) {
+        const p = new Proxy({}, { ownKeys() { return {length}; } });
+        /* index 0 is undefined, so this must fail on the very first entry */
+        assertThrows(TypeError, function() { Object.keys(p); });
+        assertThrows(TypeError, function() { Object.getOwnPropertyNames(p); });
+    }
+
+    const keys = ["a", "b", Symbol("c")];
+    const p = new Proxy({}, {
+        ownKeys() {
+            return new Proxy({length: 0xffffffff}, {
+                get(t, k) {
+                    if (k === "length") return 0xffffffff;
+                    const i = Number(k);
+                    if (i < keys.length) return keys[i];
+                    throw new RangeError("stop at " + i);
+                },
+            });
+        },
+    });
+    assertThrows(RangeError, function() { Object.getOwnPropertyNames(p); });
+}
+
 /* CVE-2023-31922 */
 function test_proxy_is_array()
 {
@@ -1357,6 +1440,7 @@ test_set();
 test_weak_set();
 test_generator();
 test_proxy_iter();
+test_proxy_own_keys_huge_length();
 test_proxy_is_array();
 test_finalization_registry();
 test_exception_source_pos();
@@ -1366,4 +1450,5 @@ test_exception_prepare_stack_data_property();
 test_exception_stack_size_limit();
 test_exception_capture_stack_trace();
 test_exception_capture_stack_trace_filter();
+test_exception_derived_constructor_stack_filter();
 test_cur_pc();
