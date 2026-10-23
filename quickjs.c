@@ -392,6 +392,9 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    /* context of the last job JS_ExecutePendingJob ran, kept alive for the
+       caller until the next call */
+    JSContext *last_job_ctx;
 
     bool module_normalize_has_attr;
     union {
@@ -2520,7 +2523,10 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     if (!e)
         return -1;
-    e->ctx = ctx;
+    /* the job keeps its context alive: nothing else may reference it once
+       the code that queued the job returns (e.g. a promise resolved from
+       another realm) */
+    e->ctx = JS_DupContext(ctx);
     e->job_func = job_func;
     e->argc = argc;
     for(i = 0; i < argc; i++) {
@@ -2543,8 +2549,17 @@ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
     return NULL;
 }
 
+static void release_last_job_context(JSRuntime *rt)
+{
+    JSContext *ctx = rt->last_job_ctx;
+    rt->last_job_ctx = NULL;
+    if (ctx)
+        JS_FreeContext(ctx);
+}
+
 /* return < 0 if exception, 0 if no job pending, 1 if a job was
-   executed successfully. the context of the job is stored in '*pctx' */
+   executed successfully. the context of the job is stored in '*pctx' and
+   stays valid until the next call */
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
@@ -2552,6 +2567,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
+    release_last_job_context(rt);
     if (list_empty(&rt->job_list)) {
         *pctx = NULL;
         return 0;
@@ -2570,6 +2586,10 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         ret = 1;
     JS_FreeValue(ctx, res);
     js_free(ctx, e);
+    /* hand the job's context reference over to the runtime; a nested call
+       made by the job may have left its own context there */
+    release_last_job_context(rt);
+    rt->last_job_ctx = ctx;
     *pctx = ctx;
     return ret;
 }
@@ -2667,10 +2687,12 @@ void JS_FreeRuntime(JSRuntime *rt)
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
 
+    release_last_job_context(rt);
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeContext(e->ctx);
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
