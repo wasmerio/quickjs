@@ -2195,8 +2195,205 @@ void private_symbols(void)
     JS_FreeRuntime(rt);
 }
 
-int main(void)
+static unsigned execution_active_calls;
+
+static JSValue execution_query(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
 {
+    bool active = JS_IsExecutingJS(JS_GetRuntime(ctx));
+    if (active)
+        execution_active_calls++;
+    return JS_NewBool(ctx, active);
+}
+
+static JSValue execution_query_data(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv,
+                                    int magic, JSValueConst *data)
+{
+    return execution_query(ctx, this_val, argc, argv);
+}
+
+static JSValue execution_query_closure(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic, void *opaque)
+{
+    /* Execution in this runtime must not affect another runtime. */
+    assert(!JS_IsExecutingJS(opaque));
+    return execution_query(ctx, this_val, argc, argv);
+}
+
+static JSValue execution_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    int mode;
+
+    assert(JS_IsExecutingJS(rt)); /* no bytecode frames in these jobs */
+    assert(argc == 1);
+    assert(0 == JS_ToInt32(ctx, &mode, argv[0]));
+    if (mode == 2)
+        return JS_Throw(ctx, JS_NewInt32(ctx, 42));
+    if (mode == 1) {
+        JSContext *job_ctx;
+        JSValue arg = JS_NewInt32(ctx, 2);
+        assert(0 == JS_EnqueueJob(ctx, execution_job, 1, &arg));
+        assert(-1 == JS_ExecutePendingJob(rt, &job_ctx));
+        assert(job_ctx == ctx);
+        assert(JS_IsExecutingJS(rt)); /* nested error did not end outer job */
+        assert(JS_HasException(ctx));
+        JSValue exception = JS_GetException(ctx);
+        assert(JS_IsSameValue(ctx, exception, JS_NewInt32(ctx, 42)));
+        JS_FreeValue(ctx, exception);
+    }
+    return JS_UNDEFINED;
+}
+
+static int execution_interrupt(JSRuntime *rt, void *opaque)
+{
+    /* The first poll can happen before the interpreter pushes its frame. */
+    return JS_IsExecutingJS(rt);
+}
+
+static void assert_execution_eval(JSContext *ctx, const char *code)
+{
+    JSValue result = eval(ctx, code);
+    assert(!JS_IsException(result));
+    assert(1 == JS_ToBool(ctx, result));
+    JS_FreeValue(ctx, result);
+    assert(!JS_IsExecutingJS(JS_GetRuntime(ctx)));
+}
+
+static void is_executing_js(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSRuntime *idle_rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *other = JS_NewContext(rt);
+    JSValue funcs[] = {
+        JS_NewCFunction(ctx, execution_query, "executing", 0),
+        JS_NewCFunctionData(ctx, execution_query_data, 0, 0, 0, NULL),
+        JS_NewCClosure(ctx, execution_query_closure, "executingClosure", NULL,
+                       0, 0, idle_rt),
+    };
+    const char *names[] = {"executing", "executingData", "executingClosure"};
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue other_global = JS_GetGlobalObject(other);
+    JSValue result;
+    JSContext *job_ctx;
+
+    assert(!JS_IsExecutingJS(rt));
+    for (int i = 0; i < (int)countof(funcs); i++) {
+        /* A C frame alone must not make the query report JavaScript. */
+        result = JS_Call(ctx, funcs[i], JS_UNDEFINED, 0, NULL);
+        assert(JS_IsBool(result) && 0 == JS_ToBool(ctx, result));
+        JS_FreeValue(ctx, result);
+        assert(1 == JS_SetPropertyStr(ctx, global, names[i], funcs[i]));
+    }
+    assert(1 == JS_SetPropertyStr(other, other_global, "executing",
+                                  JS_GetPropertyStr(ctx, global, "executing")));
+    assert_execution_eval(ctx, "executing() && executingData() && executingClosure()");
+    assert_execution_eval(other, "executing()"); /* creation realm differs */
+    assert_execution_eval(ctx,
+        "Object.defineProperty({}, 'x', {get: executing}).x && "
+        "executing.call(null) && executing.apply(null, []) && executing.bind(null)()");
+
+    /* Call every bytecode-function class from C, without an eval frame below
+       it that could hide a missing generator/async-function classification. */
+    const char *sources[] = {
+        "(() => executing())",
+        "(async () => executing())",
+        "(function* () {yield executing()})",
+        "(async function* () {yield executing()})",
+    };
+    for (int i = 0; i < (int)countof(sources); i++) {
+        JSValue func = eval(ctx, sources[i]);
+        unsigned before = execution_active_calls;
+        result = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);
+        assert(!JS_IsException(result));
+        JS_FreeValue(ctx, func);
+        if (i >= 2) {
+            JSValue next = JS_GetPropertyStr(ctx, result, "next");
+            JSValue step = JS_Call(ctx, next, result, 0, NULL);
+            assert(!JS_IsException(step));
+            JS_FreeValue(ctx, step);
+            JS_FreeValue(ctx, next);
+        }
+        JS_FreeValue(ctx, result);
+        while (JS_ExecutePendingJob(rt, &job_ctx) > 0)
+            assert(!JS_IsExecutingJS(rt));
+        assert(execution_active_calls == before + 1);
+        assert(!JS_IsExecutingJS(rt));
+    }
+
+    /* A C-driven builtin plus native callback still has no bytecode frame. */
+    result = eval(ctx, "executing.bind(null)");
+    JSValue called = JS_Call(ctx, result, JS_UNDEFINED, 0, NULL);
+    assert(JS_IsBool(called) && 0 == JS_ToBool(ctx, called));
+    JS_FreeValue(ctx, called);
+    JS_FreeValue(ctx, result);
+
+    assert_execution_eval(ctx,
+        "globalThis.g = (function*() {yield executing(); return executing()})(); "
+        "g.next().value === true");
+    assert_execution_eval(ctx, "g.next().value === true");
+    assert_execution_eval(ctx,
+        "globalThis.asyncActive = false; "
+        "(async () => {await 0; asyncActive = executing()})(); true");
+    assert(JS_IsJobPending(rt));
+    assert(!JS_IsExecutingJS(rt));
+    while (JS_ExecutePendingJob(rt, &job_ctx) > 0)
+        assert(!JS_IsExecutingJS(rt));
+    assert_execution_eval(ctx, "asyncActive === true");
+
+    for (int mode = 0; mode < 3; mode++) {
+        JSValue arg = JS_NewInt32(ctx, mode);
+        assert(0 == JS_EnqueueJob(ctx, execution_job, 1, &arg));
+        assert(!JS_IsExecutingJS(rt)); /* queued is not executing */
+        assert((mode == 2 ? -1 : 1) == JS_ExecutePendingJob(rt, &job_ctx));
+        assert(!JS_IsExecutingJS(rt));
+        if (mode == 2) {
+            assert(JS_HasException(ctx));
+            result = JS_GetException(ctx);
+            assert(JS_IsSameValue(ctx, result, JS_NewInt32(ctx, 42)));
+            JS_FreeValue(ctx, result);
+        }
+    }
+
+    result = JS_NewObject(ctx);
+    JS_Throw(ctx, JS_DupValue(ctx, result));
+    assert(!JS_IsExecutingJS(rt));
+    assert(JS_HasException(ctx));
+    called = JS_GetException(ctx);
+    assert(JS_IsSameValue(ctx, result, called));
+    JS_FreeValue(ctx, called);
+    JS_FreeValue(ctx, result);
+
+    JS_SetInterruptHandler(rt, execution_interrupt, NULL);
+    result = eval(ctx, "for (;;) {}");
+    assert(JS_IsException(result));
+    assert(!JS_IsExecutingJS(rt));
+    assert(JS_HasException(ctx));
+    result = JS_GetException(ctx);
+    assert(JS_IsUncatchableError(result));
+    JS_FreeValue(ctx, result);
+    JS_SetInterruptHandler(rt, NULL, NULL);
+
+    JS_FreeValue(other, other_global);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(other);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    JS_FreeRuntime(idle_rt);
+}
+
+int main(int argc, char **argv)
+{
+    /* The fork diverges from several upstream API-test expectations. Allow
+       this independent regression to run in CI without those other cases. */
+    if (argc > 1) {
+        assert(argc == 2 && !strcmp(argv[1], "--is-executing-js"));
+        is_executing_js();
+        return 0;
+    }
     cfunctions();
     sync_call();
     async_call();
@@ -2236,5 +2433,6 @@ int main(void)
     new_typed_array();
     std_eval_interrupt_handler();
     private_symbols();
+    is_executing_js();
     return 0;
 }
