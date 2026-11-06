@@ -44,8 +44,8 @@ jobs:
           - { os: ubuntu-latest, configType: Debug }
           - { os: ubuntu-latest, configType: Release }
           - { os: ubuntu-latest, configType: asan+ubsan }
-          - { os: macos-14, configType: Debug }
-          - { os: macos-14, configType: asan+ubsan }
+          - { os: macos-latest, configType: Debug }
+          - { os: macos-latest, configType: asan+ubsan }
     steps:
       - uses: actions/checkout@v7
         with:
