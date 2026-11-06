@@ -1368,18 +1368,9 @@ typedef struct JSSABTab {
 #define JS_WRITE_OBJ_REFERENCE (1 << 3) /* allow object references to encode arbitrary object graph */
 #define JS_WRITE_OBJ_STRIP_SOURCE  (1 << 4) /* do not write source code information */
 #define JS_WRITE_OBJ_STRIP_DEBUG   (1 << 5) /* do not write debug information */
-/* Return owned shared-buffer backing references in psab_tab. Requires
-   JS_WRITE_OBJ_SAB and non-NULL psab_tab. Release with JS_FreeSABTab, or adopt
-   the references and free only tab. The runtime needs SAB dup/free hooks.
-   Without this flag the table is borrowed, as before; source SAB objects must
-   remain alive until the embedder has retained/read their backing pointers. */
-#define JS_WRITE_OBJ_SAB_RETAIN    (1 << 6)
 JS_EXTERN uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj, int flags);
 JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
                                    int flags, JSSABTab *psab_tab);
-/* Only for an owned table returned with JS_WRITE_OBJ_SAB_RETAIN. Releases
-   each backing reference and the table allocation, then zeroes the table. */
-JS_EXTERN void JS_FreeSABTab(JSContext *ctx, JSSABTab *sab_tab);
 
 /* WARNING: only enable JS_READ_OBJ_BYTECODE on input from a trusted
    writer. The bytecode format is not designed to resist a hostile

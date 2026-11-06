@@ -1118,18 +1118,11 @@ typedef struct JSProperty {
                and the init function pointer */
             uintptr_t realm_and_id; /* realm and init_id (JS_AUTOINIT_ID_x)
                                        in the 2 low bits; 0 for a user lazy
-                                       property with JSLazyProperty opaque */
+                                       property with a definition object */
             void *opaque;
         } init;
     } u;
 } JSProperty;
-
-typedef struct JSLazyProperty {
-    /* An initializing call keeps the record alive even if JS replaces or
-       deletes the property, so its address remains a unique definition ID. */
-    int ref_count;
-    JSValue initializer;
-} JSLazyProperty;
 
 #define JS_PROP_INITIAL_SIZE 2
 #define JS_PROP_INITIAL_HASH_SIZE 4 /* must be a power of two */
@@ -6783,18 +6776,10 @@ static bool js_autoinit_is_user(JSProperty *pr)
     return pr->u.init.realm_and_id == 0;
 }
 
-static void js_lazy_property_release(JSRuntime *rt, JSLazyProperty *lazy)
-{
-    if (--lazy->ref_count == 0) {
-        JS_FreeValueRT(rt, lazy->initializer);
-        js_free_rt(rt, lazy);
-    }
-}
-
 static void js_autoinit_free(JSRuntime *rt, JSProperty *pr)
 {
     if (js_autoinit_is_user(pr))
-        js_lazy_property_release(rt, pr->u.init.opaque);
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque));
     else
         JS_FreeContext(js_autoinit_get_realm(pr));
 }
@@ -6803,8 +6788,7 @@ static void js_autoinit_mark(JSRuntime *rt, JSProperty *pr,
                              JS_MarkFunc *mark_func)
 {
     if (js_autoinit_is_user(pr)) {
-        JSLazyProperty *lazy = pr->u.init.opaque;
-        JS_MarkValue(rt, lazy->initializer, mark_func);
+        JS_MarkValue(rt, JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque), mark_func);
     } else {
         mark_func(rt, &js_autoinit_get_realm(pr)->header);
     }
@@ -7781,11 +7765,6 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
                 JSProperty *pr = &p->prop[i];
                 if (prs->atom != JS_ATOM_NULL && !(prs->flags & JS_PROP_TMASK)) {
                     compute_value_size(pr->u.value, hp);
-                } else if (prs->atom != JS_ATOM_NULL &&
-                           (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
-                           js_autoinit_is_user(pr)) {
-                    s->memory_used_count++;
-                    s->memory_used_size += sizeof(JSLazyProperty);
                 }
                 prs++;
             }
@@ -9346,20 +9325,25 @@ static int js_init_lazy_property(JSContext *ctx, JSObject *p, JSAtom prop,
                                  JSProperty *pr)
 {
     JSRuntime *rt = ctx->rt;
-    JSLazyProperty *lazy = pr->u.init.opaque;
+    JSValue definition = js_dup(JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque));
+    /* This private null-prototype object's sole property is never exposed. */
+    JSValueConst initializer = JS_VALUE_GET_OBJ(definition)->prop[0].u.value;
     JSLazyPropertyActive active, *running;
     JSShapeProperty *prs;
     JSContext *realm;
-    JSValue holder, initializer, name, val;
+    JSValue holder, name, val;
     int result = -1;
 
-    realm = JS_GetFunctionRealm(ctx, lazy->initializer);
-    if (!realm)
+    realm = JS_GetFunctionRealm(ctx, initializer);
+    if (!realm) {
+        JS_FreeValue(ctx, definition);
         return -1;
+    }
     realm = JS_DupContext(realm);
     for (running = rt->active_lazy_properties; running; running = running->previous) {
         if (running->object == p && running->atom == prop) {
             JS_ThrowRangeError(realm, "a lazy property was read by its own initializer");
+            JS_FreeValue(ctx, definition);
             JS_FreeContext(realm);
             return -1;
         }
@@ -9368,22 +9352,18 @@ static int js_init_lazy_property(JSContext *ctx, JSObject *p, JSAtom prop,
     /* A callback may remove the holder from its prototype chain, delete the
        property, reallocate its storage, run GC, or install a new definition.
        Keep all identities alive, and never use pr/prs across the JS call. */
-    lazy->ref_count++;
     holder = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
     prop = JS_DupAtom(ctx, prop);
-    initializer = js_dup(lazy->initializer);
     name = JS_AtomToValue(ctx, prop);
-    if (JS_IsException(name)) {
-        JS_FreeValue(ctx, initializer);
+    if (JS_IsException(name))
         goto done;
-    }
     active.previous = rt->active_lazy_properties;
     active.object = p;
     active.atom = prop;
     rt->active_lazy_properties = &active;
     /* JS_Call uses the initializer's own realm, including bound/proxy
        functions. No reference to the defining context is needed. */
-    val = JS_CallFree(realm, initializer, holder, 1, vc(&name));
+    val = JS_Call(realm, initializer, holder, 1, vc(&name));
     rt->active_lazy_properties = active.previous;
     JS_FreeValue(ctx, name);
     if (JS_IsException(val))
@@ -9391,7 +9371,7 @@ static int js_init_lazy_property(JSContext *ctx, JSObject *p, JSAtom prop,
 
     prs = find_own_property(&pr, p, prop);
     if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_AUTOINIT ||
-        !js_autoinit_is_user(pr) || pr->u.init.opaque != lazy) {
+        !js_autoinit_is_user(pr) || pr->u.init.opaque != JS_VALUE_GET_OBJ(definition)) {
         JS_FreeValue(ctx, val);
         JS_ThrowTypeError(realm, "a lazy property changed while its initializer ran");
         goto done;
@@ -9407,7 +9387,7 @@ static int js_init_lazy_property(JSContext *ctx, JSObject *p, JSAtom prop,
 done:
     JS_FreeAtom(ctx, prop);
     JS_FreeValue(ctx, holder);
-    js_lazy_property_release(rt, lazy);
+    JS_FreeValue(ctx, definition);
     JS_FreeContext(realm);
     return result;
 }
@@ -11931,7 +11911,7 @@ int JS_DefineLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
     JSObject *p;
     JSProperty *pr;
     JSShapeProperty *prs;
-    JSLazyProperty *lazy;
+    JSValue definition;
     uint32_t index;
     int ret;
 
@@ -11967,31 +11947,32 @@ int JS_DefineLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
         return false;
     }
 
-    lazy = js_malloc(ctx, sizeof(*lazy));
-    if (!lazy)
+    /* A private JS object supplies GC ownership and per-definition identity
+       without retaining the context that happened to define the property. */
+    definition = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(definition))
         return -1;
-    lazy->ref_count = 1;
-    lazy->initializer = js_dup(initializer);
+    if (JS_DefinePropertyValue(ctx, definition, JS_ATOM_empty_string,
+                              js_dup(initializer), 0) < 0)
+        goto fail;
     if (prs) {
-        if (js_shape_prepare_update(ctx, p, &prs)) {
-            js_lazy_property_release(ctx->rt, lazy);
-            return -1;
-        }
+        if (js_shape_prepare_update(ctx, p, &prs))
+            goto fail;
         free_property(ctx->rt, pr, prs->flags);
         prs->flags = flags | JS_PROP_AUTOINIT;
     } else {
         pr = add_property(ctx, p, prop, flags | JS_PROP_AUTOINIT);
-        if (!pr) {
-            js_lazy_property_release(ctx->rt, lazy);
-            return -1;
-        }
+        if (!pr)
+            goto fail;
     }
     /* Non-null built-in realms use all four packed IDs. The zero sentinel
-       gives user initializers separate storage without enlarging properties
-       or retaining the context which happened to define the property. */
+       supplies user storage without enlarging property slots. */
     pr->u.init.realm_and_id = 0;
-    pr->u.init.opaque = lazy;
+    pr->u.init.opaque = JS_VALUE_GET_OBJ(definition);
     return true;
+fail:
+    JS_FreeValue(ctx, definition);
+    return -1;
 }
 
 bool JS_IsLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
@@ -39254,9 +39235,8 @@ static int js_object_list_resize_hash(JSContext *ctx, JSObjectList *s,
     return 0;
 }
 
-/* Keep a strong reference until the writer ends: reading a later lazy value
-   can remove earlier objects from the source graph and collect them. Their
-   addresses must remain unique for object-reference serialization. */
+/* the reference count of 'obj' is not modified. Return 0 if OK, -1 if
+   memory error */
 static int js_object_list_add(JSContext *ctx, JSObjectList *s, JSObject *obj)
 {
     JSObjectListEntry *e;
@@ -39276,7 +39256,6 @@ static int js_object_list_add(JSContext *ctx, JSObjectList *s, JSObject *obj)
     e = &s->object_tab[s->object_count++];
     h = js_object_list_get_hash(obj, s->hash_size);
     e->obj = obj;
-    js_dup(JS_MKPTR(JS_TAG_OBJECT, obj));
     e->hash_next = s->hash_table[h];
     s->hash_table[h] = s->object_count - 1;
     return 0;
@@ -39304,8 +39283,6 @@ static int js_object_list_find(JSContext *ctx, JSObjectList *s, JSObject *obj)
 
 static void js_object_list_end(JSContext *ctx, JSObjectList *s)
 {
-    for (int i = 0; i < s->object_count; i++)
-        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, s->object_tab[i].obj));
     js_free(ctx, s->object_tab);
     js_free(ctx, s->hash_table);
 }
@@ -39346,7 +39323,6 @@ typedef struct BCWriterState {
     DynBuf dbuf;
     bool allow_bytecode;
     bool allow_sab;
-    bool retain_sab;
     bool allow_reference;
     bool allow_source;
     bool allow_debug;
@@ -39810,76 +39786,37 @@ static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
 static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
-    JSPropertyEnum *props;
-    uint32_t i, len, prop_count = 0, count;
-    JSShapeProperty *prs;
-    JSProperty *pr;
-    JSValue value;
+    uint32_t i, prop_count;
+    JSShape *sh;
+    JSShapeProperty *pr;
+    int pass;
     JSAtom atom;
-    size_t count_pos, count_size;
-    uint8_t count_bytes[5];
-    int ret;
-
-    /* Snapshot keys only. Initializers (including a nested value's) may resize
-       this object's shape, delete keys or change a later value. Ordinary
-       accessors remain unsupported; user lazy slots are data properties. */
-    if (JS_GetOwnPropertyNamesInternal(s->ctx, &props, &len, p,
-                                      JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK |
-                                      JS_GPN_PRIVATE_MASK | JS_GPN_ENUM_ONLY))
-        return -1;
-    for (i = 0; i < len; i++) {
-        prs = find_own_property(&pr, p, props[i].atom);
-        if (prs && (prs->flags & JS_PROP_TMASK) &&
-            !((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT && js_autoinit_is_user(pr))) {
-            JS_ThrowTypeError(s->ctx, "only value properties are supported");
-            goto fail;
-        }
-    }
 
     bc_put_u8(s, BC_TAG_OBJECT);
-    count_pos = s->dbuf.size;
-    bc_put_leb128(s, UINT32_MAX); /* reserve maximum count width */
-    for (i = 0; i < len; i++) {
-        atom = props[i].atom;
-        prs = find_own_property(&pr, p, atom);
-        if (!prs || !(prs->flags & JS_PROP_ENUMERABLE))
-            continue;
-        if ((prs->flags & JS_PROP_TMASK) &&
-            !((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT && js_autoinit_is_user(pr))) {
-            JS_ThrowTypeError(s->ctx, "only value properties are supported");
-            goto fail;
+    prop_count = 0;
+    sh = p->shape;
+    for(pass = 0; pass < 2; pass++) {
+        if (pass == 1)
+            bc_put_leb128(s, prop_count);
+        for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count; i++, pr++) {
+            atom = pr->atom;
+            if (atom != JS_ATOM_NULL && (pr->flags & JS_PROP_ENUMERABLE)) {
+                if (pr->flags & JS_PROP_TMASK) {
+                    JS_ThrowTypeError(s->ctx, "only value properties are supported");
+                    goto fail;
+                }
+                if (pass == 0) {
+                    prop_count++;
+                } else {
+                    bc_put_atom(s, atom);
+                    if (JS_WriteObjectRec(s, p->prop[i].u.value))
+                        goto fail;
+                }
+            }
         }
-        value = JS_GetProperty(s->ctx, obj, atom);
-        if (JS_IsException(value))
-            goto fail;
-        ret = bc_put_atom(s, atom);
-        if (!ret)
-            ret = JS_WriteObjectRec(s, value);
-        JS_FreeValue(s->ctx, value);
-        if (ret)
-            goto fail;
-        prop_count++;
     }
-    if (dbuf_error(&s->dbuf)) {
-        JS_ThrowOutOfMemory(s->ctx);
-        goto fail;
-    }
-    /* A callback can delete a later key. Patch the actual count and compact
-       its reserved LEB128 field; nested writers have already finished. */
-    count = prop_count;
-    count_size = 0;
-    do {
-        count_bytes[count_size++] = (count & 0x7f) | (count > 0x7f ? 0x80 : 0);
-        count >>= 7;
-    } while (count);
-    memmove(s->dbuf.buf + count_pos + count_size, s->dbuf.buf + count_pos + 5,
-            s->dbuf.size - count_pos - 5);
-    memcpy(s->dbuf.buf + count_pos, count_bytes, count_size);
-    s->dbuf.size -= 5 - count_size;
-    js_free_prop_enum(s->ctx, props, len);
     return 0;
  fail:
-    js_free_prop_enum(s->ctx, props, len);
     return -1;
 }
 
@@ -39916,12 +39853,7 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
     JSArrayBuffer *abuf = p->u.array_buffer;
-    JSRuntime *rt = s->ctx->rt;
     assert(!abuf->detached); /* SharedArrayBuffer are never detached */
-    if (s->retain_sab && (!rt->sab_funcs.sab_dup || !rt->sab_funcs.sab_free)) {
-        JS_ThrowTypeError(s->ctx, "retaining shared buffers requires dup/free hooks");
-        return -1;
-    }
     bc_put_u8(s, BC_TAG_SHARED_ARRAY_BUFFER);
     bc_put_leb128(s, abuf->byte_length);
     bc_put_leb128(s, abuf->max_byte_length);
@@ -39931,8 +39863,6 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
         return -1;
     /* keep the SAB pointer so that the user can clone it or free it */
     s->sab_tab[s->sab_tab_len++] = abuf->data;
-    if (s->retain_sab)
-        rt->sab_funcs.sab_dup(rt->sab_funcs.sab_opaque, abuf->data);
     return 0;
 }
 
@@ -40174,16 +40104,6 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     s->ctx = ctx;
     s->allow_bytecode = ((flags & JS_WRITE_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_WRITE_OBJ_SAB) != 0);
-    s->retain_sab = ((flags & JS_WRITE_OBJ_SAB_RETAIN) != 0);
-    if (s->retain_sab && (!s->allow_sab || !psab_tab)) {
-        JS_ThrowTypeError(ctx, "retaining shared buffers requires JS_WRITE_OBJ_SAB and a table");
-        *psize = 0;
-        if (psab_tab) {
-            psab_tab->tab = NULL;
-            psab_tab->len = 0;
-        }
-        return NULL;
-    }
     s->allow_reference = ((flags & JS_WRITE_OBJ_REFERENCE) != 0);
     s->allow_source = ((flags & JS_WRITE_OBJ_STRIP_SOURCE) == 0);
     s->allow_debug = ((flags & JS_WRITE_OBJ_STRIP_DEBUG) == 0);
@@ -40219,30 +40139,12 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     js_free(ctx, s->atom_to_idx);
     js_free(ctx, s->idx_to_atom);
     dbuf_free(&s->dbuf);
-    if (s->retain_sab) {
-        JSSABTab tab = { s->sab_tab, s->sab_tab_len };
-        JS_FreeSABTab(ctx, &tab);
-    } else {
-        js_free(ctx, s->sab_tab);
-    }
     *psize = 0;
     if (psab_tab) {
         psab_tab->tab = NULL;
         psab_tab->len = 0;
     }
     return NULL;
-}
-
-void JS_FreeSABTab(JSContext *ctx, JSSABTab *sab_tab)
-{
-    JSRuntime *rt = ctx->rt;
-    if (!sab_tab)
-        return;
-    for (size_t i = 0; i < sab_tab->len; i++)
-        rt->sab_funcs.sab_free(rt->sab_funcs.sab_opaque, sab_tab->tab[i]);
-    js_free(ctx, sab_tab->tab);
-    sab_tab->tab = NULL;
-    sab_tab->len = 0;
 }
 
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
@@ -55108,41 +55010,21 @@ static int js_map_write(BCWriterState *s, struct JSMapState *map_state,
 {
     struct list_head *el;
     JSMapRecord *mr;
-    JSValue *entries;
-    size_t count = map_state ? map_state->record_count : 0, len = 0, i;
-    int result = -1;
 
-    /* A nested lazy initializer can clear or change this map/set. Snapshot
-       its entries before serializing values, retaining their JS handles. */
-    if (count > SIZE_MAX / (2 * sizeof(*entries))) {
-        JS_ThrowOutOfMemory(s->ctx);
-        return -1;
-    }
-    entries = count ? js_malloc(s->ctx, count * 2 * sizeof(*entries)) : NULL;
-    if (count && !entries)
-        return -1;
+    bc_put_leb128(s, map_state ? map_state->record_count : 0);
     if (map_state) {
         list_for_each(el, &map_state->records) {
             mr = list_entry(el, JSMapRecord, link);
-            if (!mr->empty) {
-                entries[len++] = js_dup(mr->key);
-                entries[len++] = js_dup(mr->value);
-            }
+            if (JS_WriteObjectRec(s, mr->key))
+                return -1;
+            // mr->value is always JS_UNDEFINED for sets
+            if (!(magic & MAGIC_SET))
+                if (JS_WriteObjectRec(s, mr->value))
+                    return -1;
         }
     }
-    bc_put_leb128(s, len / 2);
-    for (i = 0; i < len; i += 2) {
-        if (JS_WriteObjectRec(s, entries[i]))
-            goto done;
-        if (!(magic & MAGIC_SET) && JS_WriteObjectRec(s, entries[i + 1]))
-            goto done;
-    }
-    result = 0;
-done:
-    for (i = 0; i < len; i++)
-        JS_FreeValue(s->ctx, entries[i]);
-    js_free(s->ctx, entries);
-    return result;
+
+    return 0;
 }
 
 static JSValue JS_ReadMap(BCReaderState *s)
