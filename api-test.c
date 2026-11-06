@@ -2385,13 +2385,473 @@ static void is_executing_js(void)
     JS_FreeRuntime(idle_rt);
 }
 
+static JSClassID lazy_marker_class;
+static unsigned lazy_marker_finalized;
+static unsigned lazy_sab_live;
+
+typedef struct LazySharedBuffer {
+    size_t refs;
+    uint8_t data[];
+} LazySharedBuffer;
+
+static void *lazy_sab_alloc(void *opaque, size_t size)
+{
+    LazySharedBuffer *buffer = malloc(sizeof(*buffer) + size);
+    if (!buffer)
+        return NULL;
+    buffer->refs = 1;
+    lazy_sab_live++;
+    return buffer->data;
+}
+
+static void lazy_sab_dup(void *opaque, void *data)
+{
+    LazySharedBuffer *buffer = (LazySharedBuffer *)((uint8_t *)data - sizeof(*buffer));
+    assert(buffer->refs > 0);
+    buffer->refs++;
+}
+
+static void lazy_sab_free(void *opaque, void *data)
+{
+    LazySharedBuffer *buffer = (LazySharedBuffer *)((uint8_t *)data - sizeof(*buffer));
+    assert(buffer->refs > 0);
+    if (--buffer->refs == 0) {
+        lazy_sab_live--;
+        free(buffer);
+    }
+}
+
+static void lazy_marker_finalizer(JSRuntime *rt, JSValueConst object)
+{
+    lazy_marker_finalized++;
+}
+
+static JSValue lazy_marker(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    return JS_NewObjectClass(ctx, lazy_marker_class);
+}
+
+static JSValue lazy_define(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    JSAtom atom;
+    int flags = JS_PROP_C_W_E, ret;
+
+    assert(argc >= 3);
+    if (argc > 3 && JS_ToInt32(ctx, &flags, argv[3]))
+        return JS_EXCEPTION;
+    atom = JS_ValueToAtom(ctx, argv[1]);
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    ret = JS_DefineLazyDataProperty(ctx, argv[0], atom, argv[2], flags);
+    JS_FreeAtom(ctx, atom);
+    return ret < 0 ? JS_EXCEPTION : JS_NewBool(ctx, ret);
+}
+
+static JSValue lazy_query(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
+{
+    JSAtom atom;
+    bool lazy;
+
+    assert(argc >= 2);
+    atom = JS_ValueToAtom(ctx, argv[1]);
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    lazy = JS_IsLazyDataProperty(ctx, argv[0], atom);
+    JS_FreeAtom(ctx, atom);
+    return JS_NewBool(ctx, lazy);
+}
+
+static JSValue lazy_gc(JSContext *ctx, JSValueConst this_val,
+                        int argc, JSValueConst *argv)
+{
+    JS_RunGC(JS_GetRuntime(ctx));
+    return JS_UNDEFINED;
+}
+
+static JSValue lazy_clone(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
+{
+    size_t size;
+    JSSABTab table;
+    uint8_t *data = JS_WriteObject2(ctx, &size, argv[0],
+                                  JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_SAB_RETAIN,
+                                  &table);
+    if (!data)
+        return JS_EXCEPTION;
+    JSValue result = JS_ReadObject(ctx, data, size, JS_READ_OBJ_REFERENCE | JS_READ_OBJ_SAB);
+    JS_FreeSABTab(ctx, &table);
+    js_free(ctx, data);
+    return result;
+}
+
+static JSContext *lazy_native_expected_context;
+static unsigned lazy_exotic_calls;
+
+static int lazy_exotic_get(JSContext *ctx, JSPropertyDescriptor *desc,
+                            JSValueConst object, JSAtom prop)
+{
+    lazy_exotic_calls++;
+    JS_ThrowTypeError(ctx, "unexpected exotic property lookup");
+    return -1;
+}
+
+static JSValue lazy_native_initializer(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv,
+                                       int magic, JSValueConst *data)
+{
+    assert(ctx == lazy_native_expected_context);
+    JSAtom atom = JS_ValueToAtom(ctx, argv[0]);
+    JSValue result;
+    if (magic) {
+        result = JS_GetProperty(ctx, this_val, atom);
+    } else {
+        int ret = JS_SetProperty(ctx, this_val, atom, JS_NewInt32(ctx, 8));
+        result = ret < 0 ? JS_EXCEPTION : JS_NewInt32(ctx, 42);
+    }
+    JS_FreeAtom(ctx, atom);
+    return result;
+}
+
+static void assert_lazy_eval(JSContext *ctx, const char *code)
+{
+    JSValue result = eval(ctx, code);
+    if (JS_IsException(result)) {
+        fprintf(stderr, "lazy-property regression failed: %s\n", code);
+        js_std_dump_error(ctx);
+        assert(0);
+    }
+    assert(1 == JS_ToBool(ctx, result));
+    JS_FreeValue(ctx, result);
+}
+
+static void lazy_data_properties(void)
+{
+    static const char *const tests[] = {
+        "(() => {"
+        " let n=0; const o={before:1}, s=Symbol('lazy');"
+        " if(!lazy(o,'x',function(k){++n;return this===o&&k==='x'&&isLazy(o,k)?42:0}))return false;"
+        " lazy(o,s,function(k){++n;return k===s?43:0}); o.after=2;"
+        " const child=Object.create(o); let keys=[]; for(const k in o)keys.push(k);"
+        " if(!('x' in child)||!o.hasOwnProperty('x')||child.hasOwnProperty('x')||isLazy(child,'x'))return false;"
+        " if(Object.keys(o).join()!=='before,x,after'||keys.join()!=='before,x,after'||n)return false;"
+        " if(Reflect.ownKeys(o).at(-1)!==s||!isLazy(o,s))return false;"
+        " if(child.x!==42||o.x!==42||isLazy(o,'x')||o[s]!==43||n!==2)return false;"
+        " const d=Object.getOwnPropertyDescriptor(o,'x');"
+        " return d.value===42&&d.writable&&d.enumerable&&d.configurable&&!('get' in d); })()",
+
+        "(() => { for(let flags=0;flags<8;++flags){"
+        " const o={};let n=0;lazy(o,'x',()=>++n,flags);"
+        " if(!isLazy(o,'x'))return false;"
+        " const written=Reflect.set(o,'x',9);"
+        " if(written!==!!(flags&2)||n)return false;"
+        " if(written){if(isLazy(o,'x')||o.x!==9)return false;}"
+        " else {let threw=false;try{(function(){'use strict';o.x=9})()}catch(e){threw=e instanceof TypeError}"
+        " if(!threw||!isLazy(o,'x')||n)return false;}"
+        " const d=Object.getOwnPropertyDescriptor(o,'x');"
+        " if(d.value!==(written?9:1)||d.configurable!==!!(flags&1)||d.writable!==!!(flags&2)||d.enumerable!==!!(flags&4))return false;"
+        " const p={};lazy(p,'y',()=>{throw 1},flags);"
+        " if(Reflect.deleteProperty(p,'y')!==!!(flags&1)||isLazy(p,'y')===!!(flags&1))return false;"
+        " }return true;})()",
+
+        "(() => {let n=0;const p={};lazy(p,'x',()=>++n);const c=Object.create(p);"
+        " if(!Reflect.set(p,'x',8,c)||n||c.x!==8||!isLazy(p,'x'))return false;"
+        " const r={};lazy(r,'x',()=>++n);if(!Reflect.set(p,'x',9,r)||n||r.x!==9||isLazy(r,'x'))return false;"
+        " const q={};lazy(q,'x',()=>++n,0);const d=Object.create(q);"
+        " return !Reflect.set(q,'x',7,d)&&!d.hasOwnProperty('x')&&isLazy(q,'x')&&n===0;})()",
+
+        "(() => {let n=0;const o={a:1,get x(){throw 99},b:2};"
+        " if(!lazy(o,'x',()=>++n)||Object.keys(o).join()!=='a,x,b'||n)return false;"
+        " if(!lazy(o,'x',()=>42)||n||o.x!==42)return false;"
+        " const d=Object.getOwnPropertyDescriptor(o,'x');"
+        " Object.preventExtensions(o);if(!lazy(o,'x',()=>43)||o.x!==43)return false;"
+        " Object.defineProperty(o,'x',{configurable:false});"
+        " return !lazy(o,'x',()=>44)&&!lazy(o,'new',()=>0)&&o.x===43;})()",
+
+        "(() => {let n=0;const o={},error={};lazy(o,'x',()=>{if(++n===1)throw error;return 42});"
+        " try{Object.getOwnPropertyDescriptor(o,'x');return false}catch(e){if(e!==error)return false}"
+        " return isLazy(o,'x')&&o.x===42&&n===2&&!isLazy(o,'x');})()",
+
+        "(() => {const o={};lazy(o,'x',()=>o.x);"
+        " try{o.x;return false}catch(e){if(!(e instanceof RangeError))return false}"
+        " if(!isLazy(o,'x'))return false;"
+        " lazy(o,'x',()=>{try{Object.defineProperty(o,'x',{value:8})}catch(e){return e instanceof RangeError?42:0}});"
+        " return o.x===42&&!isLazy(o,'x');})()",
+
+        "(() => {for(const action of [o=>o.x=8,o=>delete o.x,o=>lazy(o,'x',()=>9)]){"
+        " const o={};lazy(o,'x',()=>{action(o);gcLazy();return 42});"
+        " try{o.x;return false}catch(e){if(!(e instanceof TypeError))return false}"
+        " if(o.hasOwnProperty('x')&&o.x!==8&&o.x!==9)return false;"
+        " }const o={};let recursive=false;"
+        " lazy(o,'x',()=>{lazy(o,'x',()=>9);try{o.x}catch(e){recursive=e instanceof RangeError}return 42});"
+        " try{o.x;return false}catch(e){if(!(e instanceof TypeError))return false}"
+        " return recursive&&isLazy(o,'x')&&o.x===9;})()",
+
+        "(() => {const o={},error={};lazy(o,'x',function(){this.x=8;throw error});"
+        " try{o.x;return false}catch(e){if(e!==error)return false}"
+        " return o.x===8&&!isLazy(o,'x');})()",
+
+        "(() => {const o={before:1};lazy(o,'x',function(){"
+        " for(let i=0;i<1000;i++)this['grow'+i]=i;"
+        " for(let i=0;i<900;i++)delete this['grow'+i];gcLazy();return 42});"
+        " return o.x===42&&o.grow999===999&&Object.keys(o).slice(0,2).join()==='before,x';})()",
+
+        "(() => {let child=Object.create({tag:42});"
+        " lazy(Object.getPrototypeOf(child),'x',function(){Object.setPrototypeOf(child,null);gcLazy();return this.tag});"
+        " return child.x===42&&Object.getPrototypeOf(child)===null;})()",
+
+        "(() => {const o={};let n=0;lazy(o,'a',()=>++n);lazy(o,'b',()=>++n);"
+        " const d=Object.getOwnPropertyDescriptors(o);"
+        " return d.a.value===1&&d.b.value===2&&n===2&&!isLazy(o,'a')&&!isLazy(o,'b');})()",
+
+        "(() => {const o={};let n=0;lazy(o,'x',()=>++n);Object.freeze(o);"
+        " return isLazy(o,'x')&&n===0&&Object.isFrozen(o)&&o.x===1&&!isLazy(o,'x');})()",
+
+        "(() => {let traps=0;const o={},p=new Proxy(o,{getOwnPropertyDescriptor(){++traps;throw 0},defineProperty(){++traps;throw 0}});"
+        " lazy(o,'x',()=>42);const revoked=Proxy.revocable(o,{});revoked.revoke();"
+        " return !isLazy(p,'x')&&!isLazy(revoked.proxy,'x')&&!lazy(p,'x',()=>0)&&traps===0&&isLazy(o,'x');})()",
+
+        "(() => {const a=new Uint8Array(4);"
+        " for(const key of ['0','4294967294','-0','NaN','Infinity','-Infinity','-1','1.5','4294967295','1e+21'])"
+        " if(lazy(a,key,()=>1))throw Error('accepted numeric key '+key);"
+        " for(const key of ['01','1e21','+1','0.10','-','Infinity!'])"
+        " if(!lazy(a,key,()=>42)||a[key]!==42)throw Error('rejected ordinary key '+key);"
+        " const o={};if(lazy(o,'0',()=>1)||lazy(o,'4294967294',()=>1))return false;"
+        " return lazy(o,'4294967295',()=>42)&&o['4294967295']===42;})()",
+
+        "(() => {const o={};lazy(o,'x',()=>({answer:42}));gcLazy();"
+        " const value=o.x;gcLazy();return value===o.x&&value.answer===42;})()",
+
+        "(() => {const o={};let n=0;lazy(o,'x',()=>++n);lazy(o,'hidden',()=>++n,0);"
+        " const c=cloneLazy(o);return c.x===1&&n===1&&!isLazy(o,'x')&&isLazy(o,'hidden')&&!('hidden' in c);})()",
+
+        "(() => {const o={};lazy(o,'first',function(){delete this.later;"
+        " for(let i=0;i<1000;i++)this['new'+i]=i;gcLazy();return 42});o.later=9;o.last=8;"
+        " const c=cloneLazy(o);return c.first===42&&c.last===8&&!('later' in c)&&!('new0' in c);})()",
+
+        "(() => {const o={first:{}};const nested={};"
+        " lazy(nested,'x',()=>{delete o.first;o.later=42;gcLazy();return 8});o.nested=nested;o.later=9;"
+        " const c=cloneLazy(o);return typeof c.first==='object'&&c.nested.x===8&&c.later===42;})()",
+
+        "(() => {const o={};for(let i=0;i<150;i++)lazy(o,'key'+i,()=>i);"
+        " const c=cloneLazy(o);return Object.keys(c).length===150&&c.key149===149;})()",
+
+        "(() => {const error={},o={};lazy(o,'x',()=>{throw error});"
+        " try{cloneLazy(o);return false}catch(e){return e===error&&isLazy(o,'x')}})()",
+
+        "(() => {let n=0;const o={get x(){++n;return 42}};"
+        " try{cloneLazy(o);return false}catch(e){return e instanceof TypeError&&n===0}})()",
+
+        "(() => {const o={},m=new Map([[1,o],[2,9]]);"
+        " lazy(o,'x',()=>{m.clear();gcLazy();return 42});const c=cloneLazy(m);"
+        " return m.size===0&&c.size===2&&c.get(1).x===42&&c.get(2)===9;})()",
+
+        "(() => {const o={},s=new Set([o,9]);"
+        " lazy(o,'x',()=>{s.clear();gcLazy();return 42});const c=cloneLazy(s);"
+        " return s.size===0&&c.size===2&&[...c][0].x===42&&c.has(9);})()",
+
+        "(() => {const o={sab:new SharedArrayBuffer(8)};new Uint8Array(o.sab)[0]=42;"
+        " lazy(o,'x',function(){delete this.sab;gcLazy();return 9});const c=cloneLazy(o);"
+        " return !('sab' in o)&&c.x===9&&new Uint8Array(c.sab)[0]===42;})()",
+
+        "(() => {const error={},o={sab:new SharedArrayBuffer(8)};"
+        " lazy(o,'x',function(){delete this.sab;gcLazy();throw error});"
+        " try{cloneLazy(o);return false}catch(e){return e===error&&isLazy(o,'x')}})()",
+    };
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSClassDef marker_def = { .class_name = "LazyMarker", .finalizer = lazy_marker_finalizer };
+    JSSharedArrayBufferFunctions sab_funcs = {
+        .sab_alloc = lazy_sab_alloc, .sab_free = lazy_sab_free, .sab_dup = lazy_sab_dup,
+    };
+
+    lazy_sab_live = 0;
+    JS_SetSharedArrayBufferFunctions(rt, &sab_funcs);
+    lazy_marker_class = 0;
+    lazy_marker_finalized = 0;
+    JS_NewClassID(rt, &lazy_marker_class);
+    assert(0 == JS_NewClass(rt, lazy_marker_class, &marker_def));
+    JS_SetPropertyStr(ctx, global, "lazy", JS_NewCFunction(ctx, lazy_define, "lazy", 4));
+    JS_SetPropertyStr(ctx, global, "isLazy", JS_NewCFunction(ctx, lazy_query, "isLazy", 2));
+    JS_SetPropertyStr(ctx, global, "gcLazy", JS_NewCFunction(ctx, lazy_gc, "gcLazy", 0));
+    JS_SetPropertyStr(ctx, global, "lazyMarker", JS_NewCFunction(ctx, lazy_marker, "lazyMarker", 0));
+    JS_SetPropertyStr(ctx, global, "cloneLazy", JS_NewCFunction(ctx, lazy_clone, "cloneLazy", 1));
+    for (size_t i = 0; i < countof(tests); i++)
+        assert_lazy_eval(ctx, tests[i]);
+    JS_RunGC(rt);
+    assert(lazy_sab_live == 0);
+
+    /* The original non-retaining API keeps its borrowed-table ownership. */
+    JSValue borrowed_sab = eval(ctx, "new SharedArrayBuffer(8)");
+    size_t borrowed_size;
+    JSSABTab borrowed_tab;
+    uint8_t *borrowed_data = JS_WriteObject2(ctx, &borrowed_size, borrowed_sab,
+                                            JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                                            &borrowed_tab);
+    assert(borrowed_data && borrowed_tab.len == 1 && lazy_sab_live == 1);
+    LazySharedBuffer *backing = (LazySharedBuffer *)(borrowed_tab.tab[0] - sizeof(*backing));
+    assert(backing->refs == 1);
+    js_free(ctx, borrowed_tab.tab);
+    js_free(ctx, borrowed_data);
+    JS_FreeValue(ctx, borrowed_sab);
+    assert(lazy_sab_live == 0);
+
+    /* Trace the initializer's closed-over object/holder cycle, and collect it
+       when no ordinary root remains. The extra marker detects a leak without
+       depending on implementation-specific GC object counts. */
+    assert_lazy_eval(ctx,
+        "(() => {const o={},m=lazyMarker();lazy(o,'x',()=>[o,m]);return true})()");
+    JS_RunGC(rt);
+    assert(lazy_marker_finalized == 1);
+
+    /* Defining in a temporary realm must not retain that realm if the holder
+       and initializer both belong to the principal realm. */
+    JSContext *other = JS_NewContext(rt);
+    JSValue other_global = JS_GetGlobalObject(other);
+    JSValue object = JS_NewObject(ctx);
+    JSValue initializer = eval(ctx, "(function(){return 42})");
+    JSAtom atom = JS_NewAtom(ctx, "cross");
+    JS_SetPropertyStr(other, other_global, "marker", JS_NewObjectClass(other, lazy_marker_class));
+    assert(1 == JS_DefineLazyDataProperty(other, object, atom, initializer, JS_PROP_C_W_E));
+    JS_FreeValue(ctx, initializer);
+    JS_FreeValue(other, other_global);
+    JS_FreeContext(other);
+    JS_RunGC(rt);
+    assert(lazy_marker_finalized == 2);
+    assert(JS_IsLazyDataProperty(ctx, object, atom));
+    JSValue value = JS_GetProperty(ctx, object, atom);
+    int32_t answer;
+    assert(0 == JS_ToInt32(ctx, &answer, value) && answer == 42);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, object);
+
+    /* Conversely, a live initializer retains and runs in its own realm even
+       after the embedder releases that realm's context handle. */
+    other = JS_NewContext(rt);
+    other_global = JS_GetGlobalObject(other);
+    JS_SetPropertyStr(other, other_global, "realmMarker", JS_NewObjectClass(other, lazy_marker_class));
+    initializer = eval(other, "(function(name){return [globalThis.realmMarker,name,Array.prototype]})");
+    JSValue other_proto = eval(other, "Array.prototype");
+    object = JS_NewObject(ctx);
+    assert(1 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+    JS_FreeValue(other, initializer);
+    JS_FreeValue(other, other_global);
+    JS_FreeContext(other);
+    JS_RunGC(rt);
+    assert(lazy_marker_finalized == 2);
+    value = JS_GetProperty(ctx, object, atom);
+    assert(!JS_IsException(value));
+    JSValue result_proto = JS_GetPropertyUint32(ctx, value, 2);
+    assert(JS_IsSameValue(ctx, other_proto, result_proto));
+    JSValue result_name = JS_GetPropertyUint32(ctx, value, 1);
+    const char *name = JS_ToCString(ctx, result_name);
+    assert(name && !strcmp(name, "cross"));
+    JS_FreeCString(ctx, name);
+    JS_FreeValue(ctx, result_name);
+    JS_FreeValue(ctx, result_proto);
+    JS_FreeValue(ctx, other_proto);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, object);
+    JS_RunGC(rt);
+    assert(lazy_marker_finalized == 3);
+
+    /* The read happens in ctx, while errors created by initialization belong
+       to the initializer's realm, just like the callback's own errors. */
+    other = JS_NewContext(rt);
+    object = JS_NewObject(ctx);
+    const char *error_sources[] = {
+        "(function(k){this[k]=8;return 42})",
+        "(function(k){return this[k]})",
+    };
+    const char *error_prototypes[] = { "TypeError.prototype", "RangeError.prototype" };
+    for (size_t i = 0; i < countof(error_sources); i++) {
+        initializer = eval(other, error_sources[i]);
+        assert(1 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+        JS_FreeValue(other, initializer);
+        value = JS_GetProperty(ctx, object, atom);
+        assert(JS_IsException(value));
+        JSValue error = JS_GetException(ctx);
+        JSValue error_proto = JS_GetPrototype(ctx, error);
+        JSValue expected_proto = eval(other, error_prototypes[i]);
+        assert(JS_IsSameValue(ctx, expected_proto, error_proto));
+        JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, error_proto);
+        JS_FreeValue(other, expected_proto);
+    }
+    lazy_native_expected_context = other;
+    for (size_t i = 0; i < countof(error_sources); i++) {
+        initializer = JS_NewCFunctionData(other, lazy_native_initializer, 1, i, 0, NULL);
+        assert(1 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+        JS_FreeValue(other, initializer);
+        value = JS_GetProperty(ctx, object, atom);
+        assert(JS_IsException(value));
+        JSValue error = JS_GetException(ctx);
+        JSValue error_proto = JS_GetPrototype(ctx, error);
+        JSValue expected_proto = eval(other, error_prototypes[i]);
+        assert(JS_IsSameValue(ctx, expected_proto, error_proto));
+        JS_FreeValue(ctx, error);
+        JS_FreeValue(ctx, error_proto);
+        JS_FreeValue(other, expected_proto);
+    }
+    JS_FreeValue(ctx, object);
+    JS_FreeContext(other);
+
+    /* Query/definition must reject embedder exotics without entering them. */
+    JSClassID exotic_class = 0;
+    JSClassExoticMethods exotic_methods = { .get_own_property = lazy_exotic_get };
+    JSClassDef exotic_def = { .class_name = "LazyExotic", .exotic = &exotic_methods };
+    JS_NewClassID(rt, &exotic_class);
+    assert(0 == JS_NewClass(rt, exotic_class, &exotic_def));
+    object = JS_NewObjectClass(ctx, exotic_class);
+    initializer = eval(ctx, "(function(){return 42})");
+    lazy_exotic_calls = 0;
+    assert(!JS_IsLazyDataProperty(ctx, object, atom));
+    assert(0 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+    assert(lazy_exotic_calls == 0);
+    JS_FreeValue(ctx, initializer);
+    JS_FreeValue(ctx, object);
+
+    /* Interrupts propagate unchanged and leave the original lazy record for
+       a retry/redefinition after the embedder clears termination. */
+    object = JS_NewObject(ctx);
+    initializer = eval(ctx, "(function(){for(;;){}})");
+    assert(1 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+    JS_FreeValue(ctx, initializer);
+    JS_SetInterruptHandler(rt, execution_interrupt, NULL);
+    value = JS_GetProperty(ctx, object, atom);
+    assert(JS_IsException(value));
+    value = JS_GetException(ctx);
+    assert(JS_IsUncatchableError(value));
+    JS_FreeValue(ctx, value);
+    JS_SetInterruptHandler(rt, NULL, NULL);
+    assert(JS_IsLazyDataProperty(ctx, object, atom));
+    int flags;
+    assert(1 == JS_GetOwnPropertyFlags(ctx, &flags, object, atom));
+    assert(flags == JS_PROP_C_W_E);
+    assert(JS_IsLazyDataProperty(ctx, object, atom));
+    JS_FreeValue(ctx, object);
+
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(int argc, char **argv)
 {
     /* The fork diverges from several upstream API-test expectations. Allow
-       this independent regression to run in CI without those other cases. */
+       independent regressions to run in CI without those other cases. */
     if (argc > 1) {
-        assert(argc == 2 && !strcmp(argv[1], "--is-executing-js"));
-        is_executing_js();
+        assert(argc == 2);
+        if (!strcmp(argv[1], "--is-executing-js"))
+            is_executing_js();
+        else {
+            assert(!strcmp(argv[1], "--lazy-data-properties"));
+            lazy_data_properties();
+        }
         return 0;
     }
     cfunctions();
@@ -2434,5 +2894,6 @@ int main(int argc, char **argv)
     std_eval_interrupt_handler();
     private_symbols();
     is_executing_js();
+    lazy_data_properties();
     return 0;
 }

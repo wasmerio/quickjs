@@ -4250,7 +4250,7 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
     JSThreadState *ts = js_get_thread_state(rt);
     JSWorkerData *worker = JS_GetOpaque2(ctx, this_val, ts->worker_class_id);
     JSWorkerMessagePipe *ps;
-    size_t data_len, i;
+    size_t data_len;
     uint8_t *data;
     JSWorkerMessage *msg;
     JSSABTab sab_tab;
@@ -4259,7 +4259,7 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
 
     data = JS_WriteObject2(ctx, &data_len, argv[0],
-                           JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                           JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE | JS_WRITE_OBJ_SAB_RETAIN,
                            &sab_tab);
     if (!data)
         return JS_EXCEPTION;
@@ -4288,10 +4288,7 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
     js_free(ctx, data);
     js_free(ctx, sab_tab.tab);
 
-    /* increment the SAB reference counts */
-    for(i = 0; i < msg->sab_tab_len; i++) {
-        js_sab_dup(NULL, msg->sab_tab[i]);
-    }
+    /* The message adopts the writer's retained SAB backing references. */
 
     ps = worker->send_pipe;
     js_mutex_lock(&ps->mutex);
@@ -4308,7 +4305,7 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
         free(msg);
     }
     js_free(ctx, data);
-    js_free(ctx, sab_tab.tab);
+    JS_FreeSABTab(ctx, &sab_tab);
     return JS_EXCEPTION;
 
 }

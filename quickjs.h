@@ -1021,6 +1021,11 @@ JS_EXTERN int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                                      int flags);
 JS_EXTERN int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
                                 JSValueConst obj, JSAtom prop);
+/* Return 1 if present, 0 if absent, -1 on exception. Only attributes
+   (JS_PROP_C_W_E and JS_PROP_GETSET) are read; a lazy value stays lazy.
+   An exotic object's own-property hook may still execute. */
+JS_EXTERN int JS_GetOwnPropertyFlags(JSContext *ctx, int *flags,
+                                     JSValueConst obj, JSAtom prop);
 JS_EXTERN void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                                    uint32_t len);
 
@@ -1058,6 +1063,19 @@ JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                 JSAtom prop, JSValueConst val,
                                 JSValueConst getter, JSValueConst setter,
                                 int flags);
+/* Define an own lazy data property. Arguments are borrowed and flags may
+   contain only JS_PROP_C_W_E. The initializer is GC-traced and called in its
+   own realm as initializer.call(obj, prop) on the first get or descriptor
+   read; a throw keeps the property lazy. Enumeration and existence checks do
+   not initialize it, nor do assignment/deletion. Array indices and typed-array
+   numeric indices are unsupported. Return 1 on success, 0 when the definition
+   is rejected without an exception, or -1 on an exception (such as OOM).
+   Proxies, custom exotic classes and non-configurable properties are rejected. */
+JS_EXTERN int JS_DefineLazyDataProperty(JSContext *ctx, JSValueConst obj,
+                                       JSAtom prop, JSValueConst initializer,
+                                       int flags);
+/* Inspect only the object's own storage. Never calls JS or proxy traps. */
+JS_EXTERN bool JS_IsLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop);
 JS_EXTERN int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
                                      JSAtom prop, JSValue val, int flags);
 JS_EXTERN int JS_DefinePropertyValueUint32(JSContext *ctx, JSValueConst this_obj,
@@ -1350,9 +1368,18 @@ typedef struct JSSABTab {
 #define JS_WRITE_OBJ_REFERENCE (1 << 3) /* allow object references to encode arbitrary object graph */
 #define JS_WRITE_OBJ_STRIP_SOURCE  (1 << 4) /* do not write source code information */
 #define JS_WRITE_OBJ_STRIP_DEBUG   (1 << 5) /* do not write debug information */
+/* Return owned shared-buffer backing references in psab_tab. Requires
+   JS_WRITE_OBJ_SAB and non-NULL psab_tab. Release with JS_FreeSABTab, or adopt
+   the references and free only tab. The runtime needs SAB dup/free hooks.
+   Without this flag the table is borrowed, as before; source SAB objects must
+   remain alive until the embedder has retained/read their backing pointers. */
+#define JS_WRITE_OBJ_SAB_RETAIN    (1 << 6)
 JS_EXTERN uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj, int flags);
 JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
                                    int flags, JSSABTab *psab_tab);
+/* Only for an owned table returned with JS_WRITE_OBJ_SAB_RETAIN. Releases
+   each backing reference and the table allocation, then zeroes the table. */
+JS_EXTERN void JS_FreeSABTab(JSContext *ctx, JSSABTab *sab_tab);
 
 /* WARNING: only enable JS_READ_OBJ_BYTECODE on input from a trusted
    writer. The bytecode format is not designed to resist a hostile
