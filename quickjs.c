@@ -324,6 +324,14 @@ typedef struct JSValueLink {
     JSValueConst value;
 } JSValueLink;
 
+/* The stack of arbitrary JS lazy initializers. Unlike the per-definition
+   record, this key survives replacement of a property during its callback. */
+typedef struct JSLazyPropertyActive {
+    struct JSLazyPropertyActive *previous;
+    JSObject *object;
+    JSAtom atom;
+} JSLazyPropertyActive;
+
 typedef struct JSClass {
     uint32_t class_id; /* 0 means free entry */
     JSAtom class_name;
@@ -378,6 +386,7 @@ struct JSRuntime {
     bool in_free;
 
     struct JSStackFrame *current_stack_frame;
+    JSLazyPropertyActive *active_lazy_properties;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -1108,7 +1117,8 @@ typedef struct JSProperty {
             /* in order to use only 2 pointers, we compress the realm
                and the init function pointer */
             uintptr_t realm_and_id; /* realm and init_id (JS_AUTOINIT_ID_x)
-                                       in the 2 low bits */
+                                       in the 2 low bits; 0 for a user lazy
+                                       property with a definition object */
             void *opaque;
         } init;
     } u;
@@ -1435,6 +1445,7 @@ static void free_property(JSRuntime *rt, JSProperty *pr, int prop_flags);
 static int JS_ToBigInt64Free(JSContext *ctx, int64_t *pres, JSValue val);
 static JSValue JS_ThrowStackOverflow(JSContext *ctx);
 static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
+static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj);
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag);
@@ -6626,6 +6637,7 @@ JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
 
 typedef struct JSCFunctionDataRecord {
     JSCFunctionData *func;
+    JSContext *realm;
     uint8_t length;
     uint8_t data_len;
     uint16_t magic;
@@ -6638,6 +6650,7 @@ static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
     int i;
 
     if (s) {
+        JS_FreeContext(s->realm);
         for(i = 0; i < s->data_len; i++) {
             JS_FreeValueRT(rt, s->data[i]);
         }
@@ -6652,6 +6665,7 @@ static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
     int i;
 
     if (s) {
+        mark_func(rt, &s->realm->header);
         for(i = 0; i < s->data_len; i++) {
             JS_MarkValue(rt, s->data[i], mark_func);
         }
@@ -6720,6 +6734,7 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
         return JS_EXCEPTION;
     }
     s->func = func;
+    s->realm = JS_DupContext(ctx);
     s->length = length;
     s->data_len = data_len;
     s->magic = magic;
@@ -6756,15 +6771,27 @@ static JSAutoInitIDEnum js_autoinit_get_id(JSProperty *pr)
     return pr->u.init.realm_and_id & 3;
 }
 
+static bool js_autoinit_is_user(JSProperty *pr)
+{
+    return pr->u.init.realm_and_id == 0;
+}
+
 static void js_autoinit_free(JSRuntime *rt, JSProperty *pr)
 {
-    JS_FreeContext(js_autoinit_get_realm(pr));
+    if (js_autoinit_is_user(pr))
+        JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque));
+    else
+        JS_FreeContext(js_autoinit_get_realm(pr));
 }
 
 static void js_autoinit_mark(JSRuntime *rt, JSProperty *pr,
                              JS_MarkFunc *mark_func)
 {
-    mark_func(rt, &js_autoinit_get_realm(pr)->header);
+    if (js_autoinit_is_user(pr)) {
+        JS_MarkValue(rt, JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque), mark_func);
+    } else {
+        mark_func(rt, &js_autoinit_get_realm(pr)->header);
+    }
 }
 
 typedef struct JSCClosureRecord {
@@ -9294,6 +9321,77 @@ static JSAutoInitFunc *const js_autoinit_func_table[] = {
     js_bytecode_autoinit, /* JS_AUTOINIT_ID_BYTECODE */
 };
 
+static int js_init_lazy_property(JSContext *ctx, JSObject *p, JSAtom prop,
+                                 JSProperty *pr)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue definition = js_dup(JS_MKPTR(JS_TAG_OBJECT, pr->u.init.opaque));
+    /* This private null-prototype object's sole property is never exposed. */
+    JSValueConst initializer = JS_VALUE_GET_OBJ(definition)->prop[0].u.value;
+    JSLazyPropertyActive active, *running;
+    JSShapeProperty *prs;
+    JSContext *realm;
+    JSValue holder, name, val;
+    int result = -1;
+
+    realm = JS_GetFunctionRealm(ctx, initializer);
+    if (!realm) {
+        JS_FreeValue(ctx, definition);
+        return -1;
+    }
+    realm = JS_DupContext(realm);
+    for (running = rt->active_lazy_properties; running; running = running->previous) {
+        if (running->object == p && running->atom == prop) {
+            JS_ThrowRangeError(realm, "a lazy property was read by its own initializer");
+            JS_FreeValue(ctx, definition);
+            JS_FreeContext(realm);
+            return -1;
+        }
+    }
+
+    /* A callback may remove the holder from its prototype chain, delete the
+       property, reallocate its storage, run GC, or install a new definition.
+       Keep all identities alive, and never use pr/prs across the JS call. */
+    holder = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
+    prop = JS_DupAtom(ctx, prop);
+    name = JS_AtomToValue(ctx, prop);
+    if (JS_IsException(name))
+        goto done;
+    active.previous = rt->active_lazy_properties;
+    active.object = p;
+    active.atom = prop;
+    rt->active_lazy_properties = &active;
+    /* JS_Call uses the initializer's own realm, including bound/proxy
+       functions. No reference to the defining context is needed. */
+    val = JS_Call(realm, initializer, holder, 1, vc(&name));
+    rt->active_lazy_properties = active.previous;
+    JS_FreeValue(ctx, name);
+    if (JS_IsException(val))
+        goto done; /* retain the definition and retry on the next read */
+
+    prs = find_own_property(&pr, p, prop);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_AUTOINIT ||
+        !js_autoinit_is_user(pr) || pr->u.init.opaque != JS_VALUE_GET_OBJ(definition)) {
+        JS_FreeValue(ctx, val);
+        JS_ThrowTypeError(realm, "a lazy property changed while its initializer ran");
+        goto done;
+    }
+    if (js_shape_prepare_update(ctx, p, &prs)) {
+        JS_FreeValue(ctx, val);
+        goto done;
+    }
+    js_autoinit_free(rt, pr);
+    prs->flags &= ~JS_PROP_TMASK;
+    pr->u.value = val;
+    result = 0;
+done:
+    JS_FreeAtom(ctx, prop);
+    JS_FreeValue(ctx, holder);
+    JS_FreeValue(ctx, definition);
+    JS_FreeContext(realm);
+    return result;
+}
+
 /* warning: 'prs' is reallocated after it */
 static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
                                JSProperty *pr, JSShapeProperty *prs)
@@ -9301,6 +9399,9 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     JSValue val;
     JSContext *realm;
     JSAutoInitFunc *func;
+
+    if (js_autoinit_is_user(pr))
+        return js_init_lazy_property(ctx, p, prop, pr);
 
     if (js_shape_prepare_update(ctx, p, &prs))
         return -1;
@@ -9315,6 +9416,20 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     if (JS_IsException(val))
         return -1;
     pr->u.value = val;
+    return 0;
+}
+
+/* An ordinary assignment replaces a writable user lazy definition without
+   reading it. val is borrowed; the caller keeps the usual setter ownership. */
+static int js_set_lazy_property_value(JSContext *ctx, JSObject *p,
+                                      JSProperty *pr, JSShapeProperty *prs,
+                                      JSValueConst val)
+{
+    if (js_shape_prepare_update(ctx, p, &prs))
+        return -1;
+    js_autoinit_free(ctx->rt, pr);
+    prs->flags &= ~JS_PROP_TMASK;
+    pr->u.value = js_dup(val);
     return 0;
 }
 
@@ -9397,6 +9512,17 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
                     return js_dup(val);
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+                    if (js_autoinit_is_user(pr)) {
+                        JSValue holder = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
+                        JSValue result;
+                        if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
+                            result = JS_EXCEPTION;
+                        else
+                            result = JS_GetPropertyInternal(ctx, holder, prop,
+                                                            this_obj, throw_ref_error);
+                        JS_FreeValue(ctx, holder);
+                        return result;
+                    }
                     /* Instantiate property and retry */
                     if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
                         return JS_EXCEPTION;
@@ -9958,6 +10084,16 @@ retry:
                     }
                     desc->value = js_dup(val);
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+                    if (js_autoinit_is_user(pr)) {
+                        JSValue holder = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
+                        int ret;
+                        if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
+                            ret = -1;
+                        else
+                            ret = JS_GetOwnPropertyInternal2(ctx, desc, p, prop, pflags);
+                        JS_FreeValue(ctx, holder);
+                        return ret;
+                    }
                     /* Instantiate property and retry */
                     if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
                         return -1;
@@ -10052,6 +10188,15 @@ int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
         return -1;
     }
     return JS_GetOwnPropertyInternal(ctx, desc, JS_VALUE_GET_OBJ(obj), prop);
+}
+
+int JS_GetOwnPropertyFlags(JSContext *ctx, int *flags, JSValueConst obj, JSAtom prop)
+{
+    if (!JS_IsObject(obj)) {
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return -1;
+    }
+    return JS_GetOwnPropertyFlagsInternal(ctx, flags, JS_VALUE_GET_OBJ(obj), prop);
 }
 
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
@@ -10815,6 +10960,14 @@ retry:
             set_value(ctx, pr->u.var_ref->pvalue, val);
             return true;
         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+            if (js_autoinit_is_user(pr)) {
+                if (!(prs->flags & JS_PROP_WRITABLE))
+                    goto read_only_prop;
+                if (js_set_lazy_property_value(ctx, p, pr, prs, val))
+                    goto fail;
+                ret = true;
+                goto done;
+            }
             /* Instantiate property and retry (potentially useless) */
             if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
                 goto fail;
@@ -10931,6 +11084,11 @@ retry:
             if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                 return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
             } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+                if (js_autoinit_is_user(pr)) {
+                    if (!(prs->flags & JS_PROP_WRITABLE))
+                        goto read_only_prop;
+                    break;
+                }
                 /* Instantiate property and retry (potentially useless) */
                 if (JS_AutoInitProperty(ctx, p1, prop, pr, prs))
                     return -1;
@@ -10994,9 +11152,15 @@ retry:
             ret = JS_ThrowTypeErrorReadOnly(ctx, flags, prop);
             goto done;
         }
-        ret = JS_DefineProperty(ctx, this_obj, prop, val,
-                                JS_UNDEFINED, JS_UNDEFINED,
-                                JS_PROP_HAS_VALUE);
+        prs = find_own_property(&pr, p, prop);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+            js_autoinit_is_user(pr)) {
+            ret = js_set_lazy_property_value(ctx, p, pr, prs, val) ? -1 : true;
+        } else {
+            ret = JS_DefineProperty(ctx, this_obj, prop, val,
+                                    JS_UNDEFINED, JS_UNDEFINED,
+                                    JS_PROP_HAS_VALUE);
+        }
     } else {
         if (unlikely(!p->extensible)) {
             ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
@@ -11451,6 +11615,19 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
     if (prs) {
+        /* [[DefineOwnProperty]] reads the current data descriptor, even
+           when the requested attributes would otherwise be rejected. */
+        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+            js_autoinit_is_user(pr)) {
+            JSValue holder = js_dup(this_obj);
+            int ret;
+            if (JS_AutoInitProperty(ctx, p, prop, pr, prs))
+                ret = -1;
+            else
+                ret = JS_DefineProperty(ctx, holder, prop, val, getter, setter, flags);
+            JS_FreeValue(ctx, holder);
+            return ret;
+        }
         /* the range of the Array length property is always tested before */
         if ((prs->flags & JS_PROP_LENGTH) && (flags & JS_PROP_HAS_VALUE)) {
             uint32_t array_length;
@@ -11726,6 +11903,93 @@ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
     pr->u.init.realm_and_id |= id;
     pr->u.init.opaque = opaque;
     return true;
+}
+
+int JS_DefineLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                              JSValueConst initializer, int flags)
+{
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSValue definition;
+    uint32_t index;
+    int ret;
+
+    if (!JS_IsObject(obj) || !JS_IsFunction(ctx, initializer) ||
+        prop == JS_ATOM_NULL || (flags & ~JS_PROP_C_W_E))
+        return false;
+    p = JS_VALUE_GET_OBJ(obj);
+    /* A native exotic may synthesize descriptors or properties not present
+       in the shape, and could run arbitrary embedder code while doing so. */
+    if (p->class_id == JS_CLASS_PROXY ||
+        (p->class_id >= JS_CLASS_INIT_COUNT && p->is_exotic))
+        return false;
+    if (JS_AtomIsArrayIndex(ctx, &index, prop))
+        return false;
+    if (is_typed_array(p->class_id)) {
+        /* The engine's historical numeric-index fast path omits NaN.
+           Reject it here too without broadening unrelated typed-array paths. */
+        JSAtomStruct *name = ctx->rt->atom_array[prop];
+        if (name->atom_type == JS_ATOM_TYPE_STRING && name->len == 3 &&
+            string_get(name, 0) == 'N' && string_get(name, 1) == 'a' &&
+            string_get(name, 2) == 'N')
+            return false;
+        ret = JS_AtomIsNumericIndex(ctx, prop);
+        if (ret != 0)
+            return ret < 0 ? -1 : false;
+    }
+
+    prs = find_own_property(&pr, p, prop);
+    if (prs) {
+        if (!(prs->flags & JS_PROP_CONFIGURABLE))
+            return false;
+    } else if (!p->extensible) {
+        return false;
+    }
+
+    /* A private JS object supplies GC ownership and per-definition identity
+       without retaining the context that happened to define the property. */
+    definition = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(definition))
+        return -1;
+    if (JS_DefinePropertyValue(ctx, definition, JS_ATOM_empty_string,
+                              js_dup(initializer), 0) < 0)
+        goto fail;
+    if (prs) {
+        if (js_shape_prepare_update(ctx, p, &prs))
+            goto fail;
+        free_property(ctx->rt, pr, prs->flags);
+        prs->flags = flags | JS_PROP_AUTOINIT;
+    } else {
+        pr = add_property(ctx, p, prop, flags | JS_PROP_AUTOINIT);
+        if (!pr)
+            goto fail;
+    }
+    /* Non-null built-in realms use all four packed IDs. The zero sentinel
+       supplies user storage without enlarging property slots. */
+    pr->u.init.realm_and_id = 0;
+    pr->u.init.opaque = JS_VALUE_GET_OBJ(definition);
+    return true;
+fail:
+    JS_FreeValue(ctx, definition);
+    return -1;
+}
+
+bool JS_IsLazyDataProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSObject *p;
+
+    if (!JS_IsObject(obj) || prop == JS_ATOM_NULL)
+        return false;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id == JS_CLASS_PROXY ||
+        (p->class_id >= JS_CLASS_INIT_COUNT && p->is_exotic))
+        return false;
+    prs = find_own_property(&pr, p, prop);
+    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+        js_autoinit_is_user(pr);
 }
 
 /* Like JS_DefinePropertyValue but borrows val (does not free it) */
@@ -21230,6 +21494,9 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     switch(p->class_id) {
     case JS_CLASS_C_FUNCTION:
         realm = p->u.cfunc.realm;
+        break;
+    case JS_CLASS_C_FUNCTION_DATA:
+        realm = p->u.c_function_data_record->realm;
         break;
     case JS_CLASS_BYTECODE_FUNCTION:
     case JS_CLASS_GENERATOR_FUNCTION:
@@ -42536,6 +42803,20 @@ static JSValue js_object_seal(JSContext *ctx, JSValueConst this_val,
     for(i = 0; i < len; i++) {
         int prop_flags;
         JSAtom prop = props[i].atom;
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, prop);
+
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+            js_autoinit_is_user(pr)) {
+            /* Integrity-level changes inspect attributes, not a data value.
+               Keep lazy slots lazy while sealing/freezing them. */
+            prop_flags = prs->flags & ~JS_PROP_CONFIGURABLE;
+            if (freeze_flag)
+                prop_flags &= ~JS_PROP_WRITABLE;
+            if (js_update_property_flags(ctx, p, &prs, prop_flags))
+                goto exception;
+            continue;
+        }
 
         desc_flags = JS_PROP_THROW | JS_PROP_HAS_CONFIGURABLE;
         if (freeze_flag) {

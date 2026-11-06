@@ -125,6 +125,7 @@ cxxtest: cxxtest.cc quickjs.h
 test: $(QJS)
 	$(RUN262) -c tests.conf
 	$(BUILD_DIR)/api-test --is-executing-js
+	$(BUILD_DIR)/api-test --lazy-data-properties
 
 test262: $(QJS)
 	$(RUN262) -m -c test262.conf -a

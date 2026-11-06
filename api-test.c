@@ -2385,13 +2385,132 @@ static void is_executing_js(void)
     JS_FreeRuntime(idle_rt);
 }
 
+static unsigned lazy_collected;
+
+static void lazy_finalizer(JSRuntime *rt, JSValueConst value)
+{
+    lazy_collected++;
+}
+
+static JSValue lazy_define(JSContext *ctx, JSValueConst receiver,
+                          int argc, JSValueConst *argv)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, argv[1]);
+    if (atom == JS_ATOM_NULL)
+        return JS_EXCEPTION;
+    int ret = JS_DefineLazyDataProperty(ctx, argv[0], atom, argv[2], JS_PROP_C_W_E);
+    JS_FreeAtom(ctx, atom);
+    return ret < 0 ? JS_EXCEPTION : JS_NewBool(ctx, ret);
+}
+
+static JSValue lazy_gc(JSContext *ctx, JSValueConst receiver,
+                      int argc, JSValueConst *argv)
+{
+    JS_RunGC(JS_GetRuntime(ctx));
+    return JS_UNDEFINED;
+}
+
+static JSValue lazy_mutate(JSContext *ctx, JSValueConst receiver,
+                          int argc, JSValueConst *argv, int magic,
+                          JSValueConst *data)
+{
+    if (JS_SetPropertyStr(ctx, receiver, "x", JS_NewInt32(ctx, 8)) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+static void lazy_data_properties(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt), *other;
+    JSValue global = JS_GetGlobalObject(ctx), value, initializer, other_global;
+    JSValue object = JS_NewObject(ctx);
+    JSAtom atom = JS_NewAtom(ctx, "x");
+    JSClassID marker_class = 0;
+    JSClassDef marker = { .class_name = "LazyMarker", .finalizer = lazy_finalizer };
+    int flags, answer;
+
+    JS_SetPropertyStr(ctx, global, "lazy", JS_NewCFunction(ctx, lazy_define, "lazy", 3));
+    JS_SetPropertyStr(ctx, global, "gc", JS_NewCFunction(ctx, lazy_gc, "gc", 0));
+    assert_execution_eval(ctx,
+        "(() => {let child=Object.create({answer:42});"
+        "lazy(Object.getPrototypeOf(child),'x',function(){"
+        "Object.setPrototypeOf(child,null);gc();return this.answer});"
+        "return child.x===42&&Object.getPrototypeOf(child)===null})()");
+    assert_execution_eval(ctx,
+        "(() => {const o={};lazy(o,'x',function(){"
+        "for(let i=0;i<1000;i++)this['p'+i]=i;"
+        "for(let i=0;i<900;i++)delete this['p'+i];gc();return 42});"
+        "return o.x===42&&o.p999===999})()");
+    assert_execution_eval(ctx,
+        "(() => {const o={};let recursive=false;lazy(o,'x',()=>{"
+        "lazy(o,'x',()=>9);try{o.x}catch(e){recursive=e instanceof RangeError}return 42});"
+        "try{o.x;return false}catch(e){if(!(e instanceof TypeError))return false}"
+        "return recursive&&o.x===9})()");
+
+    /* A lazy initializer/holder cycle must be visible to the cycle collector. */
+    lazy_collected = 0;
+    JS_NewClassID(rt, &marker_class);
+    assert(0 == JS_NewClass(rt, marker_class, &marker));
+    JS_SetPropertyStr(ctx, global, "marker", JS_NewObjectClass(ctx, marker_class));
+    assert_execution_eval(ctx,
+        "(() => {const o={},m=marker;globalThis.marker=null;"
+        "lazy(o,'x',()=>[o,m]);return true})()");
+    JS_RunGC(rt);
+    assert(lazy_collected == 1);
+
+    /* Defining from another realm does not keep that unrelated realm alive. */
+    other = JS_NewContext(rt);
+    other_global = JS_GetGlobalObject(other);
+    JS_SetPropertyStr(other, other_global, "marker", JS_NewObjectClass(other, marker_class));
+    initializer = eval(ctx, "(function(){return 42})");
+    assert(1 == JS_DefineLazyDataProperty(other, object, atom, initializer, JS_PROP_C_W_E));
+    JS_FreeValue(ctx, initializer);
+    JS_FreeValue(other, other_global);
+    JS_FreeContext(other);
+    JS_RunGC(rt);
+    assert(lazy_collected == 2);
+    assert(1 == JS_GetOwnPropertyFlags(ctx, &flags, object, atom));
+    assert(flags == JS_PROP_C_W_E && JS_IsLazyDataProperty(ctx, object, atom));
+    value = JS_GetProperty(ctx, object, atom);
+    assert(0 == JS_ToInt32(ctx, &answer, value) && answer == 42);
+    assert(!JS_IsLazyDataProperty(ctx, object, atom));
+    JS_FreeValue(ctx, value);
+
+    /* The engine's mutation error belongs to a native initializer's realm. */
+    other = JS_NewContext(rt);
+    initializer = JS_NewCFunctionData(other, lazy_mutate, 1, 0, 0, NULL);
+    assert(1 == JS_DefineLazyDataProperty(ctx, object, atom, initializer, JS_PROP_C_W_E));
+    JS_FreeValue(other, initializer);
+    value = JS_GetProperty(ctx, object, atom);
+    assert(JS_IsException(value));
+    value = JS_GetException(ctx);
+    JSValue proto = JS_GetPrototype(ctx, value);
+    JSValue expected = eval(other, "TypeError.prototype");
+    assert(JS_IsSameValue(ctx, proto, expected));
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, proto);
+    JS_FreeValue(other, expected);
+    JS_FreeValue(ctx, object);
+    JS_FreeContext(other);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(int argc, char **argv)
 {
     /* The fork diverges from several upstream API-test expectations. Allow
-       this independent regression to run in CI without those other cases. */
+       these independent regressions to run in CI without those other cases. */
     if (argc > 1) {
-        assert(argc == 2 && !strcmp(argv[1], "--is-executing-js"));
-        is_executing_js();
+        assert(argc == 2);
+        if (!strcmp(argv[1], "--is-executing-js"))
+            is_executing_js();
+        else {
+            assert(!strcmp(argv[1], "--lazy-data-properties"));
+            lazy_data_properties();
+        }
         return 0;
     }
     cfunctions();
@@ -2434,5 +2553,6 @@ int main(int argc, char **argv)
     std_eval_interrupt_handler();
     private_symbols();
     is_executing_js();
+    lazy_data_properties();
     return 0;
 }
