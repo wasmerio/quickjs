@@ -395,6 +395,8 @@ struct JSRuntime {
     /* context of the last job JS_ExecutePendingJob ran, kept alive for the
        caller until the next call */
     JSContext *last_job_ctx;
+    /* includes nested JS_ExecutePendingJob calls */
+    unsigned executing_job_depth;
 
     bool module_normalize_has_attr;
     union {
@@ -2580,6 +2582,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
+    rt->executing_job_depth++;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
@@ -2594,6 +2597,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     release_last_job_context(rt);
     rt->last_job_ctx = ctx;
     *pctx = ctx;
+    rt->executing_job_depth--;
     return ret;
 }
 
@@ -6482,6 +6486,20 @@ static bool js_class_has_bytecode(JSClassID class_id)
             class_id == JS_CLASS_GENERATOR_FUNCTION ||
             class_id == JS_CLASS_ASYNC_FUNCTION ||
             class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION);
+}
+
+bool JS_IsExecutingJS(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+
+    if (rt->executing_job_depth != 0)
+        return true;
+    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
+        if (JS_IsObject(sf->cur_func) &&
+            js_class_has_bytecode(JS_VALUE_GET_OBJ(sf->cur_func)->class_id))
+            return true;
+    }
+    return false;
 }
 
 /* return NULL without exception if not a function or no bytecode */

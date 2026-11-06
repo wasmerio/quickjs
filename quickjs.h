@@ -1327,6 +1327,11 @@ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                             int argc, JSValueConst *argv);
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
+/* True while a JavaScript frame or an executing job exists in this runtime,
+   across all contexts. C-only calls, suspended coroutines and queued jobs do
+   not count. Does not allocate, invoke JavaScript or change pending exceptions.
+   Call only on the runtime's owning thread. */
+JS_EXTERN bool JS_IsExecutingJS(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 /* The job's context is stored in '*pctx' and stays valid until the next call
    (or JS_FreeRuntime). */
